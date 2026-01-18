@@ -3,6 +3,17 @@
 #include <esp_sleep.h>
 #include "esp_wifi.h"
 
+#define DEBUG 1   // set to 0 to disable all serial logs
+
+#if DEBUG
+  #define DBG(x) Serial.println(x)
+  #define DBG2(x,y) { Serial.print(x); Serial.println(y); }
+#else
+  #define DBG(x)
+  #define DBG2(x,y)
+#endif
+
+
 // ----- Pins -----
 const int TANK1_PIN = 23;
 const int TANK2_PIN = 22;
@@ -62,10 +73,12 @@ void blinkLed(int count, int onMs = 200, int offMs = 200) {
 }
 
 void sendCode(uint8_t code) {
+  DBG2("INDICATOR TX → code = ", code);
   TankMessage msg;
   msg.tankId = code;
   esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
 }
+
 
 void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
   // not used
@@ -108,6 +121,8 @@ bool isTouchActive() {
 // ---------------------------------
 void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
   if (len != sizeof(TankMessage)) return;
+
+  DBG2("INDICATOR RX ← tankId = ", ((TankMessage*)data)->tankId);
 
   TankMessage msg;
   memcpy(&msg, data, sizeof(msg));
@@ -153,11 +168,15 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
 
     // ---- Pump-session handshake: START / STOP ----
     case 50:  // START from server
+      DBG("INDICATOR: START received");
+
       // Mark that we saw START during this wake window.
       startReceived = true;
       break;
 
     case 52:  // STOP from server
+      DBG("INDICATOR: STOP received");
+
       // Pump session end requested
       stopRequested = true;
       break;
@@ -171,6 +190,11 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
 // SETUP
 // ---------------------------------
 void setup() {
+  Serial.begin(115200);
+  delay(300);
+  DBG("BOOT");
+
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
@@ -220,6 +244,8 @@ void handleIdleMode() {
     // Immediately evaluate current tank states
     bool initialTank1Full = isTankFull(TANK1_PIN);
     bool initialTank2Full = isTankFull(TANK2_PIN);
+
+    DBG("INDICATOR: ENTERING PUMP MODE");
 
     // Send READY (51) to server
     sendCode(51);
@@ -314,6 +340,8 @@ void handlePumpMode() {
   // ---- STOP handling ----
   if (stopRequested) {
     stopRequested = false;
+
+    DBG("INDICATOR: ENTERING IDLE MODE");
 
     // 4 blinks on indicator entering idle
     blinkLed(4);

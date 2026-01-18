@@ -3,6 +3,16 @@
 #include <ESP32Servo.h>
 #include "esp_wifi.h"
 
+#define DEBUG 1   // set to 0 to disable all serial logs
+
+#if DEBUG
+  #define DBG(x) Serial.println(x)
+  #define DBG2(x,y) { Serial.print(x); Serial.println(y); }
+#else
+  #define DBG(x)
+  #define DBG2(x,y)
+#endif
+
 
 #define LED_PIN 2
 
@@ -76,10 +86,12 @@ void ensurePeer(const uint8_t *mac) {
 
 void sendCode(const uint8_t *mac, uint8_t code) {
   ensurePeer(mac);
+  DBG2("SERVER TX → code = ", code);
   TankMessage msg;
   msg.tankId = code;
   esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
 }
+
 
 uint16_t calibrateTouchPin(uint8_t pin) {
   delay(300);
@@ -104,7 +116,10 @@ void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
 // RECEIVE CALLBACK
 // ---------------------------------
 void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+
   if (len != sizeof(TankMessage)) return;
+
+  DBG2("SERVER RX ← tankId = ", ((TankMessage*)data)->tankId);
 
   TankMessage msg;
   memcpy(&msg, data, sizeof(msg));
@@ -155,12 +170,15 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
 
     // ----- Pump session handshake -----
     case 51:  // READY from indicator
+      DBG("SERVER: READY received → sessionActive = true");
       waitingForReady = false;
       sessionActive   = true;
-      blinkPattern(3,120,120);  // 3-blink handshake on server
+      blinkPattern(3,120,120);
       break;
 
+
     case 53:  // ACK_STOP from indicator
+      DBG("SERVER: ACK_STOP received");
       stopAcked = true;
       blinkPattern(4);       // 4 blinks when indicator confirms idle
       sessionActive = false;
@@ -173,6 +191,11 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
 }
 
 void setup() {
+
+  Serial.begin(115200);
+  delay(300);
+  DBG("BOOT");
+
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
@@ -236,9 +259,11 @@ void loop() {
   // 1) Server range test (GPIO4)
   bool touchTest = isTouch(TOUCH_TEST_PIN, baseTest4);
   if (touchTest && !prevTouchTest) {
-    sendCode(indicatorAddress, 4);       // server test
+    DBG("SERVER: TOUCH GPIO4");
+    sendCode(indicatorAddress, 4);
     delay(200);
   }
+
   prevTouchTest = touchTest;
 
   // 2) Query Tank1 (GPIO13)
