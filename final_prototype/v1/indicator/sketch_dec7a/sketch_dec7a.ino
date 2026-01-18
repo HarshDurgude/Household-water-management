@@ -1,6 +1,7 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_sleep.h>
+#include "esp_wifi.h"
 
 // ----- Pins -----
 const int TANK1_PIN = 23;
@@ -66,8 +67,8 @@ void sendCode(uint8_t code) {
   esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
 }
 
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // ignore
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
+  // not used
 }
 
 // Ultra-sensitive tank detection (your version)
@@ -177,6 +178,10 @@ void setup() {
   pinMode(TANK2_PIN, INPUT_PULLUP);
 
   WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
   esp_now_init();
 
   esp_now_register_send_cb(onDataSent);

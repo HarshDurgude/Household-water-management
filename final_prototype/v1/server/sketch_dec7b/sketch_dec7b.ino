@@ -1,6 +1,8 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ESP32Servo.h>
+#include "esp_wifi.h"
+
 
 #define LED_PIN 2
 
@@ -93,9 +95,10 @@ bool isTouch(uint8_t pin, uint16_t baseline) {
   return (touchRead(pin) + TOUCH_MARGIN < baseline);
 }
 
-void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
   // not used
 }
+
 
 // ---------------------------------
 // RECEIVE CALLBACK
@@ -183,6 +186,11 @@ void setup() {
   baseMotor32  = calibrateTouchPin(TOUCH_MOTOR_PIN);
 
   WiFi.mode(WIFI_STA);
+  esp_wifi_set_promiscuous(true);
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+  esp_wifi_set_promiscuous(false);
+
+
   esp_now_init();
   esp_now_register_recv_cb(onDataRecv);
   esp_now_register_send_cb(onDataSent);
