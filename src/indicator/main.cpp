@@ -1,7 +1,7 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_sleep.h>
-#include "esp_wifi.h"
 
 #define DEBUG 1   // set to 0 to disable all serial logs
 
@@ -80,10 +80,10 @@ void sendCode(uint8_t code) {
   esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
 }
 
-
-void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  // not used
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  DBG("ESP-NOW: send callback");
 }
+
 
 // Ultra-sensitive tank detection (your version)
 bool isTankFull(int pin) {
@@ -120,7 +120,8 @@ bool isTouchActive() {
 // ---------------------------------
 // RECEIVE CALLBACK
 // ---------------------------------
-void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
+ {
   if (len != sizeof(TankMessage)) return;
 
   DBG2("INDICATOR RX ← tankId = ", ((TankMessage*)data)->tankId);
@@ -203,9 +204,6 @@ void setup() {
   pinMode(TANK2_PIN, INPUT_PULLUP);
 
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_promiscuous(false);
 
   esp_now_init();
 

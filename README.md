@@ -1,1 +1,0 @@
-chagpt convo : https://chatgpt.com/share/69608a7d-141c-800b-aad0-b1a6d775a40e

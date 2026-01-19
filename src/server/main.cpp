@@ -1,7 +1,7 @@
+#include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
 #include <ESP32Servo.h>
-#include "esp_wifi.h"
 
 #define DEBUG 1   // set to 0 to disable all serial logs
 
@@ -103,19 +103,21 @@ uint16_t calibrateTouchPin(uint8_t pin) {
   return sum / 20;
 }
 
+
 bool isTouch(uint8_t pin, uint16_t baseline) {
   return (touchRead(pin) + TOUCH_MARGIN < baseline);
 }
 
-void onDataSent(const wifi_tx_info_t *info, esp_now_send_status_t status) {
-  // not used
+void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
+  DBG("ESP-NOW: send callback");
 }
+
 
 
 // ---------------------------------
 // RECEIVE CALLBACK
 // ---------------------------------
-void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
 
   if (len != sizeof(TankMessage)) return;
 
@@ -124,17 +126,17 @@ void onDataRecv(const esp_now_recv_info *info, const uint8_t *data, int len) {
   TankMessage msg;
   memcpy(&msg, data, sizeof(msg));
 
-  const uint8_t *sender = info->src_addr;
+
+  const uint8_t *sender = mac;
 
   switch (msg.tankId) {
-
-    // ----- Tank events (indicator → server) -----
-    case 1:   // Tank1 FULL or timeout from indicator
+    case 1:
       blinkPattern(1);
       myServo.write(80); delay(1000); myServo.write(40);
       tank1Off = true;
-      sendCode(sender, 1);   // ACK 1 back
+      sendCode(sender, 1);
       break;
+
 
     case 2:   // Tank2 FULL or timeout
       blinkPattern(2);
@@ -209,9 +211,6 @@ void setup() {
   baseMotor32  = calibrateTouchPin(TOUCH_MOTOR_PIN);
 
   WiFi.mode(WIFI_STA);
-  esp_wifi_set_promiscuous(true);
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-  esp_wifi_set_promiscuous(false);
 
 
   esp_now_init();
