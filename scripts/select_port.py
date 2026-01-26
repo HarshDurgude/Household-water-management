@@ -2,37 +2,53 @@ Import("env")
 import json
 import subprocess
 import sys
+import platform
 
-target_location = env.GetProjectOption("custom_location")
+PIOENV = env["PIOENV"]
+OS = platform.system()  # 'Windows' or 'Darwin' (macOS)
 
-print(f"[AUTO] Target LOCATION = {target_location}")
+# ---- LOCATION MAP PER OS ----
+TARGETS = {
+    "Windows": {
+        "server": "1-9.3",
+        "indicator": "1-9.4",
+    },
+    "Darwin": {  # macOS
+        "server": "1-1.3",
+        "indicator": "1-1.1",
+    }
+}
 
-try:
-    result = subprocess.check_output(
-        ["pio", "device", "list", "--json-output"],
-        text=True
-    )
-except Exception as e:
-    raise RuntimeError("Failed to run pio device list") from e
+if OS not in TARGETS:
+    raise RuntimeError(f"Unsupported OS: {OS}")
 
-devices = json.loads(result)
+if PIOENV not in TARGETS[OS]:
+    raise RuntimeError(f"Unknown environment: {PIOENV}")
 
-selected_port = None
+target_location = TARGETS[OS][PIOENV]
+
+print(f"[AUTO] OS = {OS}")
+print(f"[AUTO] Target {PIOENV} at USB LOCATION = {target_location}")
+
+# Ask PlatformIO for connected devices
+result = subprocess.run(
+    ["pio", "device", "list", "--json-output"],
+    capture_output=True,
+    text=True
+)
+
+devices = json.loads(result.stdout)
 
 for dev in devices:
     hwid = dev.get("hwid", "")
     port = dev.get("port", "")
+
     if f"LOCATION={target_location}" in hwid:
-        selected_port = port
-        print(f"[AUTO] Matched port {port} for LOCATION {target_location}")
+        print(f"[AUTO] Selected port: {port}")
+        env.Replace(UPLOAD_PORT=port)
+        env.Replace(MONITOR_PORT=port)
         break
-
-if not selected_port:
-    print("[AUTO] Available devices:")
-    for dev in devices:
-        print(" ", dev)
-    raise RuntimeError(f"No ESP32 found at LOCATION={target_location}")
-
-# Apply port to upload & monitor
-env.Replace(UPLOAD_PORT=selected_port)
-env.Replace(MONITOR_PORT=selected_port)
+else:
+    raise RuntimeError(
+        f"No ESP32 found for {PIOENV} at LOCATION={target_location}"
+    )
