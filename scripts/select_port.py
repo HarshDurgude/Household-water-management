@@ -11,7 +11,7 @@ OS = platform.system()  # 'Windows' or 'Darwin' (macOS)
 TARGETS = {
     "Windows": {
         "server": "1-9.3",
-        "indicator": "1-9.4",
+        "indicator": "1-7",
     },
     "Darwin": {  # macOS
         "server": "1-1.3",
