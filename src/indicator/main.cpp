@@ -14,6 +14,19 @@
   #define DBG2(x,y)
 #endif
 
+
+// ---- BOOT button range test (indicator side) ----
+#define BOOT_PIN 0
+#define RANGE_LONG_PRESS_MS 2500
+
+bool bootPressConsumed = false;
+unsigned long bootPressStart = 0;
+
+
+unsigned long ledCooldownUntil = 0;
+const unsigned long LED_COOLDOWN_MS = 2000;
+
+
 // test comment
 
 // ----- Pins -----
@@ -65,13 +78,16 @@ bool prevTouchActive = false;
 // HELPERS
 // ---------------------------------
 void blinkLed(int count, int onMs = 200, int offMs = 200) {
+  if (millis() < ledCooldownUntil) return;
+
   for (int i = 0; i < count; i++) {
     digitalWrite(LED_PIN, HIGH);
     delay(onMs);
     digitalWrite(LED_PIN, LOW);
     delay(offMs);
   }
-  delay(250);
+
+  ledCooldownUntil = millis() + LED_COOLDOWN_MS;
 }
 
 void sendCode(uint8_t code) {
@@ -199,6 +215,8 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   DBG("BOOT");
+
+  pinMode(BOOT_PIN, INPUT_PULLUP);
 
 
   pinMode(LED_PIN, OUTPUT);
@@ -360,6 +378,25 @@ void handlePumpMode() {
     esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
     esp_deep_sleep_start();
   }
+
+  bool bootPressed = (digitalRead(BOOT_PIN) == LOW);
+  // unsigned long now = millis();
+
+  if (bootPressed) {
+    if (bootPressStart == 0 && !bootPressConsumed) {
+      bootPressStart = now;
+    }
+
+    if (!bootPressConsumed && (now - bootPressStart > RANGE_LONG_PRESS_MS)) {
+      DBG("INDICATOR: BOOT long press → RANGE TEST to SERVER");
+      sendCode(3);   // indicator-originated range test
+      bootPressConsumed = true;
+    }
+  } else {
+    bootPressStart = 0;
+    bootPressConsumed = false;
+  }
+
 
   delay(300);
 }
