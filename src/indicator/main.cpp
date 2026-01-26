@@ -1,3 +1,4 @@
+
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
@@ -170,11 +171,14 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 
     // ---- Pump-session handshake: START / STOP ----
     case 50:  // START from server
-      DBG("INDICATOR: START received");
-
-      // Mark that we saw START during this wake window.
-      startReceived = true;
+      if (!rtcInPumpMode && !startReceived) {
+        DBG("INDICATOR: START accepted");
+        startReceived = true;
+      } else {
+        DBG("INDICATOR: START ignored");
+      }
       break;
+
 
     case 52:  // STOP from server
       DBG("INDICATOR: STOP received");
@@ -329,12 +333,12 @@ void handlePumpMode() {
   prevTank2Full = tank2Full;
 
   // ---- Indicator's own capacitive range test (GPIO4) ----
-  bool touchNow = isTouchActive();
-  if (touchNow && !prevTouchActive) {
-    sendCode(3);      // indicator test
-    delay(200);
-  }
-  prevTouchActive = touchNow;
+//   bool touchNow = isTouchActive();
+//   if (touchNow && !prevTouchActive) {
+//     sendCode(3);      // indicator test
+//     delay(200);
+//   }
+//   prevTouchActive = touchNow;
 
   // ---- STOP handling ----
   if (stopRequested) {

@@ -233,16 +233,15 @@ void loop() {
   unsigned long now = millis();
 
   // ---- START handshake phase (on boot) ----
-  if (waitingForReady) {
+  if (waitingForReady && !sessionActive) {
     if (now - startPhaseStartMs < START_PHASE_DURATION_MS) {
       if (now - lastStartSendMs > START_SEND_PERIOD_MS) {
-        // Send START (50) to indicator
         sendCode(indicatorAddress, 50);
         lastStartSendMs = now;
       }
     }
-    // If READY never comes, it will keep trying until power-off.
   }
+
 
   // ---- STOP sending logic ----
   if (sessionActive && tank1Off && tank2Off && !stopAcked) {
@@ -256,14 +255,14 @@ void loop() {
   // ---- Capacitive touches on server ----
 
   // 1) Server range test (GPIO4)
-  bool touchTest = isTouch(TOUCH_TEST_PIN, baseTest4);
-  if (touchTest && !prevTouchTest) {
-    DBG("SERVER: TOUCH GPIO4");
-    sendCode(indicatorAddress, 4);
-    delay(200);
-  }
+  // bool touchTest = isTouch(TOUCH_TEST_PIN, baseTest4);
+  // if (touchTest && !prevTouchTest) {
+  //   DBG("SERVER: TOUCH GPIO4");
+  //   sendCode(indicatorAddress, 4);
+  //   delay(200);
+  // }
 
-  prevTouchTest = touchTest;
+  // prevTouchTest = touchTest;
 
   // 2) Query Tank1 (GPIO13)
   bool touchT1 = isTouch(TOUCH_TANK1_PIN, baseTank1_13);
@@ -291,3 +290,5 @@ void loop() {
 
   delay(100);
 }
+
+
