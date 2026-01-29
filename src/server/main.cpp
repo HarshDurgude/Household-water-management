@@ -37,7 +37,7 @@ const unsigned long LED_COOLDOWN_MS = 2000;
 
 // ---- Indicator MAC (your indicator board) ----
 // Replace if different:
-uint8_t indicatorAddress[] = { 0x38, 0x18, 0x2B, 0x8B, 0x3E, 0x5C };
+uint8_t indicatorAddress[] = { 0x38, 0x18, 0x2B, 0x8A, 0x46, 0x08 };
 
 // ---- Message struct ----
 typedef struct {
