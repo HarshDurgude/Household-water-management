@@ -10,12 +10,12 @@ OS = platform.system()  # 'Windows' or 'Darwin' (macOS)
 # ---- LOCATION MAP PER OS ----
 TARGETS = {
     "Windows": {
-        "server": "1-9.3",
-        "indicator": "1-7",
+        "server": "1-9.3", # middle usb 2 port
+        "indicator": "1-7", #usb 3 port (left most)
     },
     "Darwin": {  # macOS
-        "server": "1-1.3",
-        "indicator": "1-1.1",
+        "server": "1-1.3", # middle port on hub
+        "indicator": "1-1.1", # corner usb 2 port (not usb 3)
     }
 }
 
