@@ -51,8 +51,17 @@ for dev in devices:
 
     if f"LOCATION={target_location}" in hwid:
         print(f"[AUTO] Selected port: {port}")
+
+
         env.Replace(UPLOAD_PORT=port)
-        env.Replace(MONITOR_PORT=port)
+
+        # Export for monitor usage
+        env['ENV']['PIO_MONITOR_PORT'] = port
+
+        print(f"[AUTO] Upload port  = {port}")
+        print(f"[AUTO] Monitor port = {port}")
+
+        
         break
 else:
     raise RuntimeError(

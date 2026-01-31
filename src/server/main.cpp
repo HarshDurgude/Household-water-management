@@ -39,6 +39,12 @@ const unsigned long LED_COOLDOWN_MS = 2000;
 // Replace if different:
 uint8_t indicatorAddress[] = { 0x38, 0x18, 0x2B, 0x8A, 0x46, 0x08 };
 
+// ---- Ultrasonic numeric data ----
+typedef struct {
+  uint8_t type;    // 61 = distance_cm, 63 = percent
+  int16_t value;   // scaled by 100
+} UltraData;
+
 // ---- Message struct ----
 typedef struct {
   uint8_t tankId;
@@ -137,6 +143,22 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
 // ---------------------------------
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
 
+  // ---- Ultrasonic numeric packets ----
+  if (len == sizeof(UltraData)) {
+    UltraData ultra;
+    memcpy(&ultra, data, sizeof(ultra));
+
+    if (ultra.type == 61) {
+      float dist = ultra.value / 100.0;
+      DBG2("SERVER: Ultrasonic distance (cm): ", dist);
+    }
+    else if (ultra.type == 63) {
+      float percent = ultra.value / 100.0;
+      DBG2("SERVER: Water level (%): ", percent);
+    }
+    return;
+  }
+
   if (len != sizeof(TankMessage)) return;
 
   DBG2("SERVER RX ← tankId = ", ((TankMessage*)data)->tankId);
@@ -204,6 +226,18 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
       sessionActive = false;
       break;
 
+
+    case 61:
+      DBG("SERVER: Ultrasonic distance received (see indicator serial)");
+      break;
+
+    case 62:
+      DBG("SERVER: Water height received (see indicator serial)");
+      break;
+
+    case 63:
+      DBG("SERVER: Water percentage received (see indicator serial)");
+      break;
     default:
       // ignore unknown
       break;
@@ -278,15 +312,14 @@ void loop() {
 
   // ---- Capacitive touches on server ----
 
-  // 1) Server range test (GPIO4)
-  // bool touchTest = isTouch(TOUCH_TEST_PIN, baseTest4);
-  // if (touchTest && !prevTouchTest) {
-  //   DBG("SERVER: TOUCH GPIO4");
-  //   sendCode(indicatorAddress, 4);
-  //   delay(200);
-  // }
-
-  // prevTouchTest = touchTest;
+  // 1) ultrasonic querry (GPIO4)
+  bool touchUltra = isTouch(TOUCH_TEST_PIN, baseTest4);
+  if (touchUltra && !prevTouchTest) {
+    DBG("SERVER: Ultrasonic query");
+    sendCode(indicatorAddress, 60);
+    delay(200);
+  }
+  prevTouchTest = touchUltra;
 
   // 2) Query Tank1 (GPIO13)
   bool touchT1 = isTouch(TOUCH_TANK1_PIN, baseTank1_13);

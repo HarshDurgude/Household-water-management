@@ -14,6 +14,13 @@
   #define DBG2(x,y)
 #endif
 
+// ---- Ultrasonic sensor pins ----
+#define ULTRA_TRIG_PIN 18
+#define ULTRA_ECHO_PIN 19
+
+// ---- Tank geometry ----
+#define TANK_HEIGHT_CM 41.5
+
 
 // ---- BOOT button range test (indicator side) ----
 #define BOOT_PIN 0
@@ -63,6 +70,12 @@ unsigned long idleStartMs = 0;
 
 // Server MAC (room ESP32) – change if needed
 uint8_t serverAddress[] = { 0x00, 0x4B, 0x12, 0x2F, 0xFA, 0x08 };
+
+// ---- Ultrasonic numeric data ----
+typedef struct {
+  uint8_t type;    // 61 = distance_cm, 63 = percent
+  int16_t value;   // scaled by 100
+} UltraData;
 
 // Message struct
 typedef struct {
@@ -116,6 +129,45 @@ bool isTankFull(int pin) {
   }
 
   return (lowCount >= 1);
+}
+
+float measureUltrasonicCm() {
+  // Ensure clean trigger
+  digitalWrite(ULTRA_TRIG_PIN, LOW);
+  delayMicroseconds(2);
+
+  // Trigger pulse
+  digitalWrite(ULTRA_TRIG_PIN, HIGH);
+  delayMicroseconds(10);
+  digitalWrite(ULTRA_TRIG_PIN, LOW);
+
+  // Read echo (timeout ~30 ms)
+  long duration = pulseIn(ULTRA_ECHO_PIN, HIGH, 30000);
+
+  if (duration == 0) {
+    return -1.0;  // No echo / out of range
+  }
+
+  // Speed of sound: 343 m/s → 0.0343 cm/us
+  float distanceCm = (duration * 0.0343) / 2.0;
+  return distanceCm;
+}
+
+void computeWaterLevel(float distanceCm,
+                       float &waterHeight,
+                       float &percent) {
+  if (distanceCm <= 0) {
+    waterHeight = -1;
+    percent = -1;
+    return;
+  }
+
+  waterHeight = TANK_HEIGHT_CM - distanceCm;
+
+  if (waterHeight < 0) waterHeight = 0;
+  if (waterHeight > TANK_HEIGHT_CM) waterHeight = TANK_HEIGHT_CM;
+
+  percent = (waterHeight / TANK_HEIGHT_CM) * 100.0;
 }
 
 void calibrateTouch() {
@@ -203,6 +255,38 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
       stopRequested = true;
       break;
 
+    case 60: {  // Ultrasonic query
+      DBG("INDICATOR: Ultrasonic query received");
+
+      float dist = measureUltrasonicCm();
+      float waterH = 0, percent = 0;
+      computeWaterLevel(dist, waterH, percent);
+
+      if (dist < 0) {
+        DBG("INDICATOR: Ultrasonic out of range");
+        break;
+      }
+
+      // ---- DEBUG (still useful) ----
+      DBG2("INDICATOR: Distance (cm): ", dist);
+      DBG2("INDICATOR: Level (%): ", percent);
+
+      UltraData msg;
+
+      // Send distance (cm)
+      msg.type  = 61;
+      msg.value = (int16_t)(dist * 100);
+      esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
+      delay(40);
+
+      // Send percentage (%)
+      msg.type  = 63;
+      msg.value = (int16_t)(percent * 100);
+      esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
+
+      break;
+    }
+
     default:
       break;
   }
@@ -224,6 +308,10 @@ void setup() {
 
   pinMode(TANK1_PIN, INPUT_PULLUP);
   pinMode(TANK2_PIN, INPUT_PULLUP);
+
+  pinMode(ULTRA_TRIG_PIN, OUTPUT);
+  pinMode(ULTRA_ECHO_PIN, INPUT);
+  digitalWrite(ULTRA_TRIG_PIN, LOW);
 
   WiFi.mode(WIFI_STA);
 
