@@ -7,6 +7,8 @@ import platform
 PIOENV = env["PIOENV"]
 OS = platform.system()  # 'Windows' or 'Darwin' (macOS)
 
+custom_location = env.GetProjectOption("custom_location")
+
 # ---- LOCATION MAP PER OS ----
 TARGETS = {
     "Windows": {
@@ -19,13 +21,17 @@ TARGETS = {
     }
 }
 
-if OS not in TARGETS:
-    raise RuntimeError(f"Unsupported OS: {OS}")
+if custom_location:
+    target_location = custom_location
+    print(f"[AUTO] Using custom_location from platformio.ini = {target_location}")
+else:
+    if OS not in TARGETS:
+        raise RuntimeError(f"Unsupported OS: {OS}")
 
-if PIOENV not in TARGETS[OS]:
-    raise RuntimeError(f"Unknown environment: {PIOENV}")
+    if PIOENV not in TARGETS[OS]:
+        raise RuntimeError(f"Unknown environment: {PIOENV} and no custom_location set")
 
-target_location = TARGETS[OS][PIOENV]
+    target_location = TARGETS[OS][PIOENV]
 
 print(f"[AUTO] OS = {OS}")
 print(f"[AUTO] Target {PIOENV} at USB LOCATION = {target_location}")
