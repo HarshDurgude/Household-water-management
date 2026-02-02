@@ -1,0 +1,19 @@
+
+
+
+{
+  "appId": "com.harsh.tankos",
+  "appName": "TankOS",
+  "webDir": "dist",
+  "server": {
+    "url": "http://10.161.98.200:5173/",
+    "cleartext": true
+  },
+  "plugins": {
+    "StatusBar": {
+      "overlaysWebView": false,
+      "style": "LIGHT",
+      "backgroundColor": "#0B1220"
+    }
+  }
+}

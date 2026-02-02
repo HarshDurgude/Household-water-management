@@ -1,0 +1,7 @@
+<?xml version='1.0' encoding='utf-8'?>
+<resources>
+    <string name="app_name">TankOS</string>
+    <string name="title_activity_main">TankOS</string>
+    <string name="package_name">com.harsh.tankos</string>
+    <string name="custom_url_scheme">com.harsh.tankos</string>
+</resources>
