@@ -1,7 +1,11 @@
 #include <Arduino.h>
 #include <WiFi.h>
 #include <esp_now.h>
+#include "esp_wifi.h"
 #include <ESP32Servo.h>
+#include <WebServer.h>
+WebServer serverHTTP(80);
+
 
 #define DEBUG 1   // set to 0 to disable all serial logs
 
@@ -13,12 +17,25 @@
   #define DBG2(x,y)
 #endif
 
+// ---- State exposed to app ----
+float lastDistanceCm = -1;
+float lastTankPercent = -1;
+bool  lastSessionActive = false;
+bool  lastAutoCutoff = false;
+
+// ---- Pump policy decision (server) ----
+bool autoCutoffEnabled = false;
+
+unsigned long bootDetectStart = 0;
+unsigned long bootPressStart  = 0;
+bool bootPressDetected = false;
+bool bootDecisionDone  = false;
+
 // ---- BOOT button range test ----
 #define BOOT_PIN 0
 #define RANGE_LONG_PRESS_MS 2500
 
 bool bootPressConsumed = false;
-unsigned long bootPressStart = 0;
 
 // LED cooldown
 unsigned long ledCooldownUntil = 0;
@@ -38,6 +55,11 @@ const unsigned long LED_COOLDOWN_MS = 2000;
 // ---- Indicator MAC (your indicator board) ----
 // Replace if different:
 uint8_t indicatorAddress[] = { 0x38, 0x18, 0x2B, 0x8A, 0x46, 0x08 };
+
+typedef struct {
+  uint8_t type;    // message type (70 = policy, 71 = ACK)
+  uint8_t value;   // payload (0 or 1)
+} ControlMessage;
 
 // ---- Ultrasonic numeric data ----
 typedef struct {
@@ -97,12 +119,22 @@ void blinkPattern(int count, int onMs = 200, int offMs = 200) {
   ledCooldownUntil = millis() + LED_COOLDOWN_MS;
 }
 
+void handleStatus() {
+  String json = "{";
+  json += "\"tankPercent\":" + String(lastTankPercent, 1) + ",";
+  json += "\"distanceCm\":" + String(lastDistanceCm, 1) + ",";
+  json += "\"sessionActive\":" + String(lastSessionActive ? "true" : "false") + ",";
+  json += "\"autoCutoff\":" + String(lastAutoCutoff ? "true" : "false");
+  json += "}";
+
+  serverHTTP.send(200, "application/json", json);
+}
 
 void ensurePeer(const uint8_t *mac) {
   if (!esp_now_is_peer_exist(mac)) {
     esp_now_peer_info_t p = {};
     memcpy(p.peer_addr, mac, 6);
-    p.channel = 0;
+    p.channel = 1;                     // 🔴 IMPORTANT
     p.encrypt = false;
     esp_now_add_peer(&p);
   }
@@ -149,12 +181,10 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
     memcpy(&ultra, data, sizeof(ultra));
 
     if (ultra.type == 61) {
-      float dist = ultra.value / 100.0;
-      DBG2("SERVER: Ultrasonic distance (cm): ", dist);
-    }
+      lastDistanceCm = ultra.value / 100.0;
+    } 
     else if (ultra.type == 63) {
-      float percent = ultra.value / 100.0;
-      DBG2("SERVER: Water level (%): ", percent);
+      lastTankPercent = ultra.value / 100.0;
     }
     return;
   }
@@ -212,18 +242,27 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
 
     // ----- Pump session handshake -----
     case 51:  // READY from indicator
-      DBG("SERVER: READY received → sessionActive = true");
-      waitingForReady = false;
-      sessionActive   = true;
+      waitingForReady     = false;
+      sessionActive       = true;
+      lastSessionActive   = true;
+      lastAutoCutoff      = autoCutoffEnabled;
+
       blinkPattern(3,120,120);
+
+      ControlMessage policy;
+      policy.type  = 70;
+      policy.value = autoCutoffEnabled ? 1 : 0;
+
+      esp_now_send(sender, (uint8_t*)&policy, sizeof(policy));
       break;
 
 
     case 53:  // ACK_STOP from indicator
       DBG("SERVER: ACK_STOP received");
       stopAcked = true;
-      blinkPattern(4);       // 4 blinks when indicator confirms idle
+      blinkPattern(4);
       sessionActive = false;
+      lastSessionActive = false;   // ✅ ADD THIS
       break;
 
 
@@ -250,6 +289,22 @@ void setup() {
   delay(300);
   DBG("BOOT");
 
+  // 1️⃣ WiFi FIRST (this initializes lwIP / TCPIP task)
+  WiFi.mode(WIFI_AP_STA);   // 🔴 KEEP STA ALIVE FOR ESP-NOW
+  WiFi.softAP("TankOS", "12345678");
+  
+  // 🔴 FORCE CHANNEL (must match indicator)
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  // 2️⃣ THEN start WebServer
+  serverHTTP.on("/status", handleStatus);
+  serverHTTP.begin();
+  DBG("HTTP server started");
+
+  // 3️⃣ THEN everything else (ESP-NOW, GPIO, logic)
   pinMode(BOOT_PIN, INPUT_PULLUP);
 
 
@@ -265,8 +320,11 @@ void setup() {
   baseTank2_27 = calibrateTouchPin(TOUCH_TANK2_PIN);
   baseMotor32  = calibrateTouchPin(TOUCH_MOTOR_PIN);
 
-  WiFi.mode(WIFI_STA);
 
+  Serial.print("AP IP: ");
+  Serial.println(WiFi.softAPIP());
+
+  bootDetectStart = millis();
 
   esp_now_init();
   esp_now_register_recv_cb(onDataRecv);
@@ -285,6 +343,46 @@ void setup() {
 
 void loop() {
 
+  serverHTTP.handleClient();
+
+  // -------- BOOT BUTTON POLICY DECISION WINDOW --------
+  if (!bootDecisionDone) {
+
+    bool bootPressed = (digitalRead(BOOT_PIN) == LOW);
+
+    // Detect start of press (must START within first 5s)
+    if (!bootPressDetected && bootPressed && (millis() - bootDetectStart <= 5000)) {
+      bootPressDetected = true;
+      bootPressStart = millis();
+    }
+
+    // Measure continuous press (can extend beyond 5s)
+    if (bootPressDetected && bootPressed) {
+      if (millis() - bootPressStart >= 3000) {
+        autoCutoffEnabled = true;
+      }
+    }
+
+    // Finalize decision
+    if (
+        // Either no press ever started in 5s
+        (!bootPressDetected && millis() - bootDetectStart > 5000)
+        ||
+        // Or press started, and either completed or released
+        (bootPressDetected && !bootPressed)
+      ) {
+
+      bootDecisionDone = true;
+
+      // Visual feedback ONLY ONCE
+      if (autoCutoffEnabled) {
+        blinkPattern(5);   // ← THIS is where blinkPattern(5) belongs
+      }
+    }
+
+    // During decision window → do NOTHING else
+    if (!bootDecisionDone) return;
+  }
   unsigned long now = millis();
 
   // ---- START handshake phase (on boot) ----

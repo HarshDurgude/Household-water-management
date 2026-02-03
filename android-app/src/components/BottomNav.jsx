@@ -4,39 +4,53 @@ import { Zap, Droplet, GitBranch } from "lucide-react";
 export default function BottomNav() {
   const { pathname } = useLocation();
 
+  const items = [
+    {
+      to: "/pump",
+      label: "Pump",
+      icon: Zap,
+    },
+    {
+      to: "/",
+      label: "Tank",
+      icon: Droplet,
+    },
+    {
+      to: "/taps",
+      label: "Taps",
+      icon: GitBranch,
+    },
+  ];
+
   return (
-    <nav className="h-[72px] bg-gradient-to-t from-[#0b1220] to-[#0f172a] border-t border-white/10">
-      <div className="relative h-full flex items-center justify-between px-6">
+    <nav
+      className="bg-gradient-to-t from-[#0b1220] to-[#0f172a] border-t border-white/10"
+      style={{
+        paddingBottom: "calc(env(safe-area-inset-bottom) + 8px)",
+        height: "72px",
+      }}
+    >
+      <div className="h-full grid grid-cols-3 gap-3 px-4 items-center">
+        {items.map(({ to, label, icon: Icon }) => {
+          const active = pathname === to;
 
-        {/* Pump */}
-        <Link
-          to="/pump"
-          className={`flex flex-col items-center gap-1 text-sm ${
-            pathname === "/pump" ? "text-white" : "text-white/70"
-          }`}
-        >
-          <Zap className="w-6 h-6" />
-          <span>Pump</span>
-        </Link>
-
-        {/* Center Tank button */}
-        <Link to="/" className="absolute left-1/2 -translate-x-1/2 -top-6">
-          <div className="w-16 h-16 rounded-full bg-primary flex items-center justify-center shadow-xl">
-            <Droplet className="w-7 h-7 text-white" />
-          </div>
-        </Link>
-
-        {/* Taps */}
-        <Link
-          to="/taps"
-          className={`flex flex-col items-center gap-1 text-sm ${
-            pathname === "/taps" ? "text-white" : "text-white/70"
-          }`}
-        >
-          <GitBranch className="w-6 h-6" />
-          <span>Taps</span>
-        </Link>
-
+          return (
+            <Link
+              key={to}
+              to={to}
+              className={`
+                flex flex-col items-center justify-center gap-1
+                h-12 rounded-xl text-sm transition
+                ${active
+                  ? "bg-primary/20 text-white"
+                  : "text-white/70 hover:bg-white/5 active:bg-white/10"}
+              `}
+            >
+              <Icon className="w-5 h-5" />
+              <span>{label}</span>
+            </Link>
+          );
+        })}
       </div>
     </nav>
   );

@@ -3,6 +3,20 @@
 #include <WiFi.h>
 #include <esp_now.h>
 #include <esp_sleep.h>
+#include <esp_wifi.h>
+
+
+// add near the top with other globals
+const uint8_t ESP_NOW_CHANNEL = 1; // fixed channel for AP and indicator
+
+volatile bool callback_wants_blink = false;   // set by callback, handled in loop()
+volatile uint8_t callback_blink_count = 0;
+
+volatile bool callback_send_ack = false;      // for ACKs that must be sent outside callback
+volatile uint8_t ack_value_to_send = 0;
+
+// for debug: store last-received MAC
+uint8_t last_sender_mac[6] = {0,0,0,0,0,0};
 
 #define DEBUG 1   // set to 0 to disable all serial logs
 
@@ -13,6 +27,8 @@
   #define DBG(x)
   #define DBG2(x,y)
 #endif
+
+bool allowIdleExit = true;   // default safe
 
 // ---- Ultrasonic sensor pins ----
 #define ULTRA_TRIG_PIN 18
@@ -60,7 +76,7 @@ const unsigned long TANK2_TIMEOUT_MS = 27UL * 60UL * 1000UL;  // 27 minutes
 unsigned long pumpModeStartMs = 0;
 
 // Idle listening window
-const unsigned long IDLE_LISTEN_MS        = 1000;             // ~1s listen
+const unsigned long IDLE_LISTEN_MS        = 5000;             // ~1s listen
 const unsigned long IDLE_WAKE_INTERVAL_US = 5ULL * 1000000ULL; // wake every 5s
 
 // Idle state
@@ -70,6 +86,11 @@ unsigned long idleStartMs = 0;
 
 // Server MAC (room ESP32) – change if needed
 uint8_t serverAddress[] = { 0x00, 0x4B, 0x12, 0x2F, 0xFA, 0x08 };
+
+typedef struct {
+  uint8_t type;    // message type (70 = policy, 71 = ACK)
+  uint8_t value;   // payload (0 or 1)
+} ControlMessage;
 
 // ---- Ultrasonic numeric data ----
 typedef struct {
@@ -90,6 +111,22 @@ bool prevTouchActive = false;
 // ---------------------------------
 // HELPERS
 // ---------------------------------
+
+void requestIdleExit() {
+  if (!allowIdleExit) {
+    DBG("INDICATOR: Idle blocked (continuous mode)");
+    return;
+  }
+
+  DBG("INDICATOR: Entering IDLE mode");
+
+  rtcInPumpMode = false;
+  idleInitDone  = false;
+
+  esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
+  esp_deep_sleep_start();
+}
+
 void blinkLed(int count, int onMs = 200, int offMs = 200) {
   if (millis() < ledCooldownUntil) return;
 
@@ -189,14 +226,31 @@ bool isTouchActive() {
 // ---------------------------------
 // RECEIVE CALLBACK
 // ---------------------------------
-void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
- {
-  if (len != sizeof(TankMessage)) return;
+void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
-  DBG2("INDICATOR RX ← tankId = ", ((TankMessage*)data)->tankId);
+  // 1️⃣ ControlMessage (policy)
+  if (len == sizeof(ControlMessage)) {
+    ControlMessage ctrl;
+    memcpy(&ctrl, data, sizeof(ctrl));
+
+    if (ctrl.type == 70) {
+      allowIdleExit = (ctrl.value == 1);
+      DBG2("INDICATOR: allowIdleExit = ", allowIdleExit);
+
+      // ACK back
+      ControlMessage ack = {71, ctrl.value};
+      esp_now_send(serverAddress, (uint8_t*)&ack, sizeof(ack));
+    }
+    return;
+  }
+
+  // 2️⃣ TankMessage
+  if (len != sizeof(TankMessage)) return;
 
   TankMessage msg;
   memcpy(&msg, data, sizeof(msg));
+
+  DBG2("INDICATOR RX ← tankId = ", msg.tankId);
 
   switch (msg.tankId) {
     // ---- ACKs for tank events ----
@@ -239,6 +293,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len)
 
     // ---- Pump-session handshake: START / STOP ----
     case 50:  // START from server
+    DBG("INDICATOR: START packet received");
       if (!rtcInPumpMode && !startReceived) {
         DBG("INDICATOR: START accepted");
         startReceived = true;
@@ -314,6 +369,10 @@ void setup() {
   digitalWrite(ULTRA_TRIG_PIN, LOW);
 
   WiFi.mode(WIFI_STA);
+  // 🔴 FORCE SAME CHANNEL AS SERVER
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   esp_now_init();
 
@@ -322,7 +381,7 @@ void setup() {
 
   esp_now_peer_info_t peerInfo = {};
   memcpy(peerInfo.peer_addr, serverAddress, 6);
-  peerInfo.channel = 0;
+  peerInfo.channel = 1;              // 🔴 IMPORTANT
   peerInfo.encrypt = false;
   esp_now_add_peer(&peerInfo);
 
@@ -346,57 +405,53 @@ void handleIdleMode() {
     idleStartMs   = millis();
     idleInitDone  = true;
     startReceived = false;
+
+    DBG("INDICATOR: Idle listen window started");
   }
 
-  // If we received START during this wake window:
+  // 🔴 IMPORTANT: give WiFi/ESP-NOW time to run
+  delay(10);
+  yield();
+
+  // If START arrived
   if (startReceived) {
-    // Immediately evaluate current tank states
+    DBG("INDICATOR: START detected during idle");
+
     bool initialTank1Full = isTankFull(TANK1_PIN);
     bool initialTank2Full = isTankFull(TANK2_PIN);
 
-    DBG("INDICATOR: ENTERING PUMP MODE");
-
-    // Send READY (51) to server
-    sendCode(51);
-    // 3-blink handshake on indicator
+    sendCode(51);               // READY
     blinkLed(3, 120, 120);
 
-    // Enter pump mode
     rtcInPumpMode   = true;
     pumpModeStartMs = millis();
 
-    // Initialize flags
     tank1Sent = false;
     tank2Sent = false;
 
-    // Initialize prev states
     prevTank1Full = initialTank1Full;
     prevTank2Full = initialTank2Full;
 
-    // ---- NEW: handle tanks that are already full at pump start ----
     if (initialTank1Full) {
-      sendCode(1);      // Tank1 already full → tell server to turn Pump1 off
+      sendCode(1);
       tank1Sent = true;
     }
     if (initialTank2Full) {
-      sendCode(2);      // Tank2 already full → tell server to turn Pump2 off
+      sendCode(2);
       tank2Sent = true;
     }
 
-    // From next loop() call, we'll be in pump mode
     return;
   }
 
-  // Check if idle listen window expired
+  // End of listen window
   if (millis() - idleStartMs > IDLE_LISTEN_MS) {
-    // Go back to deep sleep for 5 seconds
+    DBG("INDICATOR: Idle timeout → sleeping");
+
     idleInitDone = false;
     esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
     esp_deep_sleep_start();
   }
-
-  // Small delay to avoid busy looping
-  delay(50);
 }
 
 // ---------------------------------
@@ -456,15 +511,11 @@ void handlePumpMode() {
     blinkLed(4);
 
     // ACK_STOP back to server (53)
-    sendCode(53);
+    sendCode(53); 
     delay(200);
 
     // Back to idle mode (deep sleep cycles)
-    rtcInPumpMode = false;
-    idleInitDone  = false;
-
-    esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
-    esp_deep_sleep_start();
+    requestIdleExit();
   }
 
   bool bootPressed = (digitalRead(BOOT_PIN) == LOW);
