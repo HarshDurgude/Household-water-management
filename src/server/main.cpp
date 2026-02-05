@@ -6,6 +6,20 @@
 #include <WebServer.h>
 WebServer serverHTTP(80);
 
+void sendCode(const uint8_t *mac, uint8_t code);
+
+bool bootWindowLogged = false;
+
+bool startPhaseLogged = false;
+
+// ---- HTTP live ultrasonic handling ----
+volatile bool httpWaitingForUltrasonic = false;
+unsigned long httpRequestStartMs = 0;
+
+float httpDistanceCm = -1;
+float httpTankPercent = -1;
+
+const unsigned long HTTP_ULTRA_TIMEOUT_MS = 3000;
 
 #define DEBUG 1   // set to 0 to disable all serial logs
 
@@ -44,6 +58,7 @@ const unsigned long LED_COOLDOWN_MS = 2000;
 
 
 #define LED_PIN 2
+
 
 // ---- Pins ----
 #define SERVO_PIN        5    // Servo signal
@@ -120,9 +135,50 @@ void blinkPattern(int count, int onMs = 200, int offMs = 200) {
 }
 
 void handleStatus() {
+
+  // ✅ CORS HEADERS (THIS IS THE FIX)
+  serverHTTP.sendHeader("Access-Control-Allow-Origin", "*");
+  serverHTTP.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
+  serverHTTP.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+
+  DBG("HTTP: /status requested → triggering live ultrasonic");
+
+  // Reset live values
+  httpDistanceCm = -1;
+  httpTankPercent = -1;
+  httpWaitingForUltrasonic = true;
+  httpRequestStartMs = millis();
+
+  // Send ultrasonic query to indicator
+  sendCode(indicatorAddress, 60);
+
+  // Wait (blocking, but max 3s)
+  while (httpWaitingForUltrasonic) {
+    if (millis() - httpRequestStartMs > HTTP_ULTRA_TIMEOUT_MS) {
+      break;
+    }
+    delay(10);
+    yield();
+  }
+
+  // Timeout → indicator not responding
+  if (httpWaitingForUltrasonic) {
+    DBG("HTTP: ultrasonic timeout → indicator not responding");
+
+    serverHTTP.send(
+      503,
+      "application/json",
+      "{\"error\":\"indicator_not_responding\"}"
+    );
+    return;
+  }
+
+  // Success → send live data
+  DBG("HTTP: ultrasonic response received → sending JSON");
+
   String json = "{";
-  json += "\"tankPercent\":" + String(lastTankPercent, 1) + ",";
-  json += "\"distanceCm\":" + String(lastDistanceCm, 1) + ",";
+  json += "\"tankPercent\":" + String(httpTankPercent, 1) + ",";
+  json += "\"distanceCm\":" + String(httpDistanceCm, 1) + ",";
   json += "\"sessionActive\":" + String(lastSessionActive ? "true" : "false") + ",";
   json += "\"autoCutoff\":" + String(lastAutoCutoff ? "true" : "false");
   json += "}";
@@ -142,7 +198,9 @@ void ensurePeer(const uint8_t *mac) {
 
 void sendCode(const uint8_t *mac, uint8_t code) {
   ensurePeer(mac);
-  DBG2("SERVER TX → code = ", code);
+  if (code == 60) {
+    DBG("SERVER: Requesting ultrasonic measurement from indicator");
+  } 
   TankMessage msg;
   msg.tankId = code;
   esp_now_send(mac, (uint8_t*)&msg, sizeof(msg));
@@ -165,7 +223,7 @@ bool isTouch(uint8_t pin, uint16_t baseline) {
 }
 
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  DBG("ESP-NOW: send callback");
+  // DBG("ESP-NOW: send callback");
 }
 
 
@@ -181,19 +239,39 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
     memcpy(&ultra, data, sizeof(ultra));
 
     if (ultra.type == 61) {
-      lastDistanceCm = ultra.value / 100.0;
+      httpDistanceCm = ultra.value / 100.0;
+      lastDistanceCm = httpDistanceCm;   // keep last-known in sync
+
+      DBG2("SERVER RX: Ultrasonic distance cm = ", httpDistanceCm);
     } 
     else if (ultra.type == 63) {
-      lastTankPercent = ultra.value / 100.0;
+      httpTankPercent = ultra.value / 100.0;
+      lastTankPercent = httpTankPercent; // keep last-known in sync
+
+      DBG2("SERVER RX: Tank level % = ", httpTankPercent);
     }
+
+    // If HTTP is waiting and both values are ready → mark done
+    if (httpWaitingForUltrasonic &&
+        httpDistanceCm >= 0 &&
+        httpTankPercent >= 0) {
+
+      httpWaitingForUltrasonic = false;
+      DBG("SERVER: Ultrasonic response COMPLETE → HTTP can reply");
+    }
+
     return;
   }
-
   if (len != sizeof(TankMessage)) return;
-
-  DBG2("SERVER RX ← tankId = ", ((TankMessage*)data)->tankId);
-
   TankMessage msg;
+
+  // if (msg.tankId == 51) {
+  //   DBG("SERVER: Indicator is awake → pump session established");
+
+  //   sessionActive = true;
+  //   waitingForReady = false;
+  // }
+
   memcpy(&msg, data, sizeof(msg));
 
 
@@ -242,10 +320,17 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
 
     // ----- Pump session handshake -----
     case 51:  // READY from indicator
-      waitingForReady     = false;
-      sessionActive       = true;
-      lastSessionActive   = true;
-      lastAutoCutoff      = autoCutoffEnabled;
+      DBG("SERVER: READY (51) received → session established");
+
+      waitingForReady   = false;
+      sessionActive     = true;
+      startPhaseLogged = false;
+      lastSessionActive = true;
+      lastAutoCutoff    = autoCutoffEnabled;
+
+      // 🔴 HARD STOP for START spam
+      lastStartSendMs = 0;
+      DBG("SERVER: STOPPING START(50) transmission");
 
       blinkPattern(3,120,120);
 
@@ -266,17 +351,17 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
       break;
 
 
-    case 61:
-      DBG("SERVER: Ultrasonic distance received (see indicator serial)");
-      break;
+    // case 61:
+    //   DBG("SERVER: Ultrasonic distance received (see indicator serial)");
+    //   break;
 
-    case 62:
-      DBG("SERVER: Water height received (see indicator serial)");
-      break;
+    // case 62:
+    //   DBG("SERVER: Water height received (see indicator serial)");
+    //   break;
 
-    case 63:
-      DBG("SERVER: Water percentage received (see indicator serial)");
-      break;
+    // case 63:
+    //   DBG("SERVER: Water percentage received (see indicator serial)");
+    //   break;
     default:
       // ignore unknown
       break;
@@ -289,18 +374,24 @@ void setup() {
   delay(300);
   DBG("BOOT");
 
-  // 1️⃣ WiFi FIRST (this initializes lwIP / TCPIP task)
-  WiFi.mode(WIFI_AP_STA);   // 🔴 KEEP STA ALIVE FOR ESP-NOW
-  WiFi.softAP("TankOS", "12345678");
-  
-  // 🔴 FORCE CHANNEL (must match indicator)
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
-
-  Serial.print("AP IP: ");
-  Serial.println(WiFi.softAPIP());
 
   // 2️⃣ THEN start WebServer
   serverHTTP.on("/status", handleStatus);
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin("TankNet", "tank1234");
+
+  Serial.print("Connecting to WiFi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(300);
+    Serial.print(".");
+  }
+
+  Serial.println();
+  Serial.print("Connected. IP: ");
+  Serial.println(WiFi.localIP());
+
+
   serverHTTP.begin();
   DBG("HTTP server started");
 
@@ -348,6 +439,13 @@ void loop() {
   // -------- BOOT BUTTON POLICY DECISION WINDOW --------
   if (!bootDecisionDone) {
 
+    if (!bootWindowLogged) {
+      DBG("BOOT: decision window started (0–5s)");
+      bootWindowLogged = true;
+    }
+
+    // DBG("BOOT: decision window active (0–5 seconds)");
+
     bool bootPressed = (digitalRead(BOOT_PIN) == LOW);
 
     // Detect start of press (must START within first 5s)
@@ -373,7 +471,7 @@ void loop() {
       ) {
 
       bootDecisionDone = true;
-
+        DBG2("BOOT: autoCutoffEnabled = ", autoCutoffEnabled);
       // Visual feedback ONLY ONCE
       if (autoCutoffEnabled) {
         blinkPattern(5);   // ← THIS is where blinkPattern(5) belongs
@@ -387,14 +485,24 @@ void loop() {
 
   // ---- START handshake phase (on boot) ----
   if (waitingForReady && !sessionActive) {
+
+    // Log ONCE when START phase begins
+    static bool startPhaseLogged = false;
+    if (!startPhaseLogged) {
+      DBG("SERVER: Waiting for indicator to wake (START phase)");
+      startPhaseLogged = true;
+    }
+
     if (now - startPhaseStartMs < START_PHASE_DURATION_MS) {
       if (now - lastStartSendMs > START_SEND_PERIOD_MS) {
+
+        DBG("SERVER: Attempting to wake indicator");
         sendCode(indicatorAddress, 50);
+
         lastStartSendMs = now;
       }
     }
   }
-
 
   // ---- STOP sending logic ----
   if (sessionActive && tank1Off && tank2Off && !stopAcked) {
@@ -413,7 +521,7 @@ void loop() {
   // 1) ultrasonic querry (GPIO4)
   bool touchUltra = isTouch(TOUCH_TEST_PIN, baseTest4);
   if (touchUltra && !prevTouchTest) {
-    DBG("SERVER: Ultrasonic query");
+    DBG("SERVER: Ultrasonic query via GPIO4");
     sendCode(indicatorAddress, 60);
     delay(200);
   }

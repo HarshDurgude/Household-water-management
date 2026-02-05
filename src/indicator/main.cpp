@@ -5,6 +5,7 @@
 #include <esp_sleep.h>
 #include <esp_wifi.h>
 
+bool firstBootWindow = true;
 
 // add near the top with other globals
 const uint8_t ESP_NOW_CHANNEL = 1; // fixed channel for AP and indicator
@@ -28,7 +29,7 @@ uint8_t last_sender_mac[6] = {0,0,0,0,0,0};
   #define DBG2(x,y)
 #endif
 
-bool allowIdleExit = true;   // default safe
+
 
 // ---- Ultrasonic sensor pins ----
 #define ULTRA_TRIG_PIN 18
@@ -76,10 +77,11 @@ const unsigned long TANK2_TIMEOUT_MS = 27UL * 60UL * 1000UL;  // 27 minutes
 unsigned long pumpModeStartMs = 0;
 
 // Idle listening window
-const unsigned long IDLE_LISTEN_MS        = 5000;             // ~1s listen
+const unsigned long IDLE_LISTEN_MS        = 2000;             // ~1s listen
 const unsigned long IDLE_WAKE_INTERVAL_US = 5ULL * 1000000ULL; // wake every 5s
 
 // Idle state
+bool startLatched = false;
 bool idleInitDone   = false;
 bool startReceived  = false;
 unsigned long idleStartMs = 0;
@@ -87,10 +89,7 @@ unsigned long idleStartMs = 0;
 // Server MAC (room ESP32) – change if needed
 uint8_t serverAddress[] = { 0x00, 0x4B, 0x12, 0x2F, 0xFA, 0x08 };
 
-typedef struct {
-  uint8_t type;    // message type (70 = policy, 71 = ACK)
-  uint8_t value;   // payload (0 or 1)
-} ControlMessage;
+
 
 // ---- Ultrasonic numeric data ----
 typedef struct {
@@ -112,20 +111,6 @@ bool prevTouchActive = false;
 // HELPERS
 // ---------------------------------
 
-void requestIdleExit() {
-  if (!allowIdleExit) {
-    DBG("INDICATOR: Idle blocked (continuous mode)");
-    return;
-  }
-
-  DBG("INDICATOR: Entering IDLE mode");
-
-  rtcInPumpMode = false;
-  idleInitDone  = false;
-
-  esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
-  esp_deep_sleep_start();
-}
 
 void blinkLed(int count, int onMs = 200, int offMs = 200) {
   if (millis() < ledCooldownUntil) return;
@@ -148,7 +133,7 @@ void sendCode(uint8_t code) {
 }
 
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  DBG("ESP-NOW: send callback");
+  // DBG("ESP-NOW: send callback");
 }
 
 
@@ -228,21 +213,21 @@ bool isTouchActive() {
 // ---------------------------------
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
-  // 1️⃣ ControlMessage (policy)
-  if (len == sizeof(ControlMessage)) {
-    ControlMessage ctrl;
-    memcpy(&ctrl, data, sizeof(ctrl));
+  // // 1️⃣ ControlMessage (policy)
+  // if (len == sizeof(ControlMessage)) {
+  //   ControlMessage ctrl;
+  //   memcpy(&ctrl, data, sizeof(ctrl));
 
-    if (ctrl.type == 70) {
-      allowIdleExit = (ctrl.value == 1);
-      DBG2("INDICATOR: allowIdleExit = ", allowIdleExit);
+  //   if (ctrl.type == 70) {
+  //     allowIdleExit = (ctrl.value == 1);
+  //     DBG2("INDICATOR: allowIdleExit = ", allowIdleExit);
 
-      // ACK back
-      ControlMessage ack = {71, ctrl.value};
-      esp_now_send(serverAddress, (uint8_t*)&ack, sizeof(ack));
-    }
-    return;
-  }
+  //     // ACK back
+  //     ControlMessage ack = {71, ctrl.value};
+  //     esp_now_send(serverAddress, (uint8_t*)&ack, sizeof(ack));
+  //   }
+  //   return;
+  // }
 
   // 2️⃣ TankMessage
   if (len != sizeof(TankMessage)) return;
@@ -250,7 +235,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
   TankMessage msg;
   memcpy(&msg, data, sizeof(msg));
 
-  DBG2("INDICATOR RX ← tankId = ", msg.tankId);
+  // DBG2("INDICATOR RX ← tankId = ", msg.tankId);
 
   switch (msg.tankId) {
     // ---- ACKs for tank events ----
@@ -293,7 +278,8 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
     // ---- Pump-session handshake: START / STOP ----
     case 50:  // START from server
-    DBG("INDICATOR: START packet received");
+      DBG("INDICATOR: START packet received");
+
       if (!rtcInPumpMode && !startReceived) {
         DBG("INDICATOR: START accepted");
         startReceived = true;
@@ -311,7 +297,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
       break;
 
     case 60: {  // Ultrasonic query
-      DBG("INDICATOR: Ultrasonic query received");
+      DBG("INDICATOR: Ultrasonic query (60) → measuring");
 
       float dist = measureUltrasonicCm();
       float waterH = 0, percent = 0;
@@ -332,6 +318,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
       msg.type  = 61;
       msg.value = (int16_t)(dist * 100);
       esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
+      DBG("INDICATOR: Ultrasonic data sent to server");
       delay(40);
 
       // Send percentage (%)
@@ -404,7 +391,9 @@ void handleIdleMode() {
   if (!idleInitDone) {
     idleStartMs   = millis();
     idleInitDone  = true;
-    startReceived = false;
+    if (!startLatched) {
+      startReceived = false;
+    }
 
     DBG("INDICATOR: Idle listen window started");
   }
@@ -414,20 +403,21 @@ void handleIdleMode() {
   yield();
 
   // If START arrived
-  if (startReceived) {
+  if (startReceived && !startLatched) {
     DBG("INDICATOR: START detected during idle");
+
+    // 🔴 CRITICAL: commit to pump mode IMMEDIATELY
+    rtcInPumpMode = true;
+    startLatched  = true;
+    idleInitDone  = false;
+
+    pumpModeStartMs = millis();
 
     bool initialTank1Full = isTankFull(TANK1_PIN);
     bool initialTank2Full = isTankFull(TANK2_PIN);
 
     sendCode(51);               // READY
     blinkLed(3, 120, 120);
-
-    rtcInPumpMode   = true;
-    pumpModeStartMs = millis();
-
-    tank1Sent = false;
-    tank2Sent = false;
 
     prevTank1Full = initialTank1Full;
     prevTank2Full = initialTank2Full;
@@ -441,14 +431,21 @@ void handleIdleMode() {
       tank2Sent = true;
     }
 
-    return;
+    return;   // 🔴 IMPORTANT: exit idle handler immediately
   }
+
 
   // End of listen window
   if (millis() - idleStartMs > IDLE_LISTEN_MS) {
-    DBG("INDICATOR: Idle timeout → sleeping");
 
-    idleInitDone = false;
+    if (firstBootWindow) {
+      DBG("INDICATOR: First boot window expired, staying awake");
+      firstBootWindow = false;
+      idleInitDone = false;   // restart idle listening
+      return;
+    }
+
+    DBG("INDICATOR: Idle timeout → sleeping");
     esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
     esp_deep_sleep_start();
   }
@@ -507,15 +504,19 @@ void handlePumpMode() {
 
     DBG("INDICATOR: ENTERING IDLE MODE");
 
-    // 4 blinks on indicator entering idle
     blinkLed(4);
-
-    // ACK_STOP back to server (53)
-    sendCode(53); 
+    sendCode(53);
     delay(200);
 
-    // Back to idle mode (deep sleep cycles)
-    requestIdleExit();
+    // Reset latches
+    startLatched = false;
+    startReceived = false;
+
+    rtcInPumpMode = false;
+    idleInitDone  = false;
+
+    esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
+    esp_deep_sleep_start();
   }
 
   bool bootPressed = (digitalRead(BOOT_PIN) == LOW);
