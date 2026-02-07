@@ -7,6 +7,9 @@
 
 bool firstBootWindow = true;
 
+volatile bool pumpCommit = false;
+
+
 // add near the top with other globals
 const uint8_t ESP_NOW_CHANNEL = 1; // fixed channel for AP and indicator
 
@@ -28,6 +31,18 @@ uint8_t last_sender_mac[6] = {0,0,0,0,0,0};
   #define DBG(x)
   #define DBG2(x,y)
 #endif
+
+
+// ---------- Add these definitions (place after DEBUG macros) ----------
+typedef struct {
+  uint8_t type;   // 70 = policy/ack
+  uint8_t value;  // payload
+} ControlMessage;
+
+// send result tracking (for debugging)
+volatile bool last_send_done = false;
+volatile bool last_send_success = false;
+volatile uint8_t last_sent_code = 0;
 
 
 
@@ -71,9 +86,7 @@ bool tank1Sent = false;  // did we already send tank1 full/timeout?
 bool tank2Sent = false;  // did we already send tank2 full/timeout?
 bool stopRequested = false;
 
-// Timeouts (ms)
-const unsigned long TANK1_TIMEOUT_MS = 17UL * 60UL * 1000UL;  // 17 minutes
-const unsigned long TANK2_TIMEOUT_MS = 27UL * 60UL * 1000UL;  // 27 minutes
+
 unsigned long pumpModeStartMs = 0;
 
 // Idle listening window
@@ -125,16 +138,45 @@ void blinkLed(int count, int onMs = 200, int offMs = 200) {
   ledCooldownUntil = millis() + LED_COOLDOWN_MS;
 }
 
-void sendCode(uint8_t code) {
+// ---------- REPLACE sendCode with this improved version ----------
+esp_err_t sendCode(uint8_t code) {
   DBG2("INDICATOR TX → code = ", code);
   TankMessage msg;
   msg.tankId = code;
-  esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
+
+  // record for onDataSent
+  last_send_done = false;
+  last_send_success = false;
+  last_sent_code = code;
+
+  esp_err_t res = esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
+  if (res != ESP_OK) {
+    DBG2("INDICATOR: esp_now_send() returned error: ", res);
+    last_send_done = true;
+    last_send_success = false;
+  }
+  return res;
 }
 
+
+// ---------- REPLACE onDataSent with this ----------
 void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
-  // DBG("ESP-NOW: send callback");
+  last_send_done = true;
+  last_send_success = (status == ESP_NOW_SEND_SUCCESS);
+
+  // print the MAC and status for debugging
+  char macStr[18];
+  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
+          mac_addr[0], mac_addr[1], mac_addr[2],
+          mac_addr[3], mac_addr[4], mac_addr[5]);
+
+  if (last_send_success) {
+    DBG2(String("INDICATOR: send to ") + String(macStr) + " succeeded, code=" + String(last_sent_code), "");
+  } else {
+    DBG2(String("INDICATOR: send to ") + String(macStr) + " FAILED, code=" + String(last_sent_code), "");
+  }
 }
+
 
 
 // Ultra-sensitive tank detection (your version)
@@ -213,21 +255,20 @@ bool isTouchActive() {
 // ---------------------------------
 void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
-  // // 1️⃣ ControlMessage (policy)
-  // if (len == sizeof(ControlMessage)) {
-  //   ControlMessage ctrl;
-  //   memcpy(&ctrl, data, sizeof(ctrl));
+  // 1️⃣ ControlMessage (policy/ACK) — handle first
+  if (len == sizeof(ControlMessage)) {
+    ControlMessage ctrl;
+    memcpy(&ctrl, data, sizeof(ctrl));
+    if (ctrl.type == 70) {
+      // Server policy / ACK for READY — treat as final ACK
+      // For debugging, print
+      DBG2("INDICATOR: ControlMessage 70 received (policy/ack) value=", ctrl.value);
+      // Optionally clear any retry state here if you used a retry loop
+      // e.g., mark that server acknowledged READY
+    }
+    return;
+  }
 
-  //   if (ctrl.type == 70) {
-  //     allowIdleExit = (ctrl.value == 1);
-  //     DBG2("INDICATOR: allowIdleExit = ", allowIdleExit);
-
-  //     // ACK back
-  //     ControlMessage ack = {71, ctrl.value};
-  //     esp_now_send(serverAddress, (uint8_t*)&ack, sizeof(ack));
-  //   }
-  //   return;
-  // }
 
   // 2️⃣ TankMessage
   if (len != sizeof(TankMessage)) return;
@@ -277,16 +318,52 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     }
 
     // ---- Pump-session handshake: START / STOP ----
-    case 50:  // START from server
+    case 50: {  // START from server — atomic ACCEPT + immediate READY (3x)
       DBG("INDICATOR: START packet received");
 
-      if (!rtcInPumpMode && !startReceived) {
-        DBG("INDICATOR: START accepted");
-        startReceived = true;
+      if (!rtcInPumpMode && !startLatched) {
+        DBG("INDICATOR: START accepted → pump committed");
+
+        // commit to pump mode immediately
+        rtcInPumpMode   = true;
+        startLatched    = true;
+        pumpCommit      = true;
+        idleInitDone    = false;
+        pumpModeStartMs = millis();
+
+        // measure initial tank states
+        bool initialTank1Full = isTankFull(TANK1_PIN);
+        bool initialTank2Full = isTankFull(TANK2_PIN);
+        prevTank1Full = initialTank1Full;
+        prevTank2Full = initialTank2Full;
+        tank1Sent = tank2Sent = false;
+
+        // ----- CRITICAL: send READY multiple times immediately -----
+        // send 3 quick copies with a short gap so server receives at least one
+        for (int i = 0; i < 3; ++i) {
+          esp_err_t r = sendCode(51);   // READY
+          (void)r; // we log in onDataSent
+          // tiny jitter between sends to reduce collisions
+          delay(40);
+        }
+        blinkLed(3, 120, 120);
+
+        // If tanks are already full, inform server now
+        if (initialTank1Full) {
+          sendCode(1);
+          tank1Sent = true;
+        }
+        if (initialTank2Full) {
+          sendCode(2);
+          tank2Sent = true;
+        }
+
       } else {
-        DBG("INDICATOR: START ignored");
+        DBG("INDICATOR: START ignored (already committed)");
       }
       break;
+    }
+
 
 
     case 52:  // STOP from server
@@ -388,6 +465,12 @@ void setup() {
 // IDLE MODE HANDLER (deep sleep cycle)
 // ---------------------------------
 void handleIdleMode() {
+  if (pumpCommit) {
+    // Pump already committed → idle mode forbidden
+    return;
+  }
+
+
   if (!idleInitDone) {
     idleStartMs   = millis();
     idleInitDone  = true;
@@ -403,10 +486,10 @@ void handleIdleMode() {
   yield();
 
   // If START arrived
-  if (startReceived && !startLatched) {
+  if (pumpCommit && !startLatched) {
     DBG("INDICATOR: START detected during idle");
 
-    // 🔴 CRITICAL: commit to pump mode IMMEDIATELY
+    // Finalize pump mode after commit (READY phase)
     rtcInPumpMode = true;
     startLatched  = true;
     idleInitDone  = false;
@@ -417,6 +500,8 @@ void handleIdleMode() {
     bool initialTank2Full = isTankFull(TANK2_PIN);
 
     sendCode(51);               // READY
+    DBG("INDICATOR: READY (51) sent immediately after START accept");
+
     blinkLed(3, 120, 120);
 
     prevTank1Full = initialTank1Full;
@@ -433,6 +518,7 @@ void handleIdleMode() {
 
     return;   // 🔴 IMPORTANT: exit idle handler immediately
   }
+
 
 
   // End of listen window
@@ -474,18 +560,7 @@ void handlePumpMode() {
     tank2Sent = true;
   }
 
-  // ---- Safety timeouts ----
-  if (!tank1Sent && (now - pumpModeStartMs > TANK1_TIMEOUT_MS)) {
-    // Safety: treat as tank1 full
-    sendCode(1);
-    tank1Sent = true;
-  }
 
-  if (!tank2Sent && (now - pumpModeStartMs > TANK2_TIMEOUT_MS)) {
-    // Safety: treat as tank2 full
-    sendCode(2);
-    tank2Sent = true;
-  }
 
   prevTank1Full = tank1Full;
   prevTank2Full = tank2Full;
@@ -508,12 +583,14 @@ void handlePumpMode() {
     sendCode(53);
     delay(200);
 
-    // Reset latches
-    startLatched = false;
+    // Reset latches and commit
+    pumpCommit    = false;   // 🔴 REQUIRED
+    startLatched  = false;
     startReceived = false;
 
     rtcInPumpMode = false;
     idleInitDone  = false;
+
 
     esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
     esp_deep_sleep_start();

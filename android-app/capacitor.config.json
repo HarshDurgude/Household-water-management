@@ -6,7 +6,7 @@
   "appName": "TankOS",
   "webDir": "dist",
   "server": {
-    "url": "http://10.161.98.200:5173/",
+    "url": "http://10.238.149.200:5173/",
     "cleartext": true
   },
   "plugins": {

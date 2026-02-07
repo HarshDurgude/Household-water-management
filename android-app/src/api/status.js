@@ -1,5 +1,5 @@
 export async function fetchStatus() {
-  const res = await fetch("http://192.168.4.3/status", {
+  const res = await fetch("http://192.168.4.2/status", {
     cache: "no-store",
   });
 

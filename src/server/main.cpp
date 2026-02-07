@@ -12,6 +12,16 @@ bool bootWindowLogged = false;
 
 bool startPhaseLogged = false;
 
+// ---- HARD SAFETY CUTOFF (SERVER-SIDE, PER PUMP) ----
+
+// When pump session started
+unsigned long pumpSessionStartMs = 0;
+
+// 🔴 ADJUST THESE TIMES AS NEEDED
+const unsigned long PUMP1_MAX_RUNTIME_MS = 1UL * 60UL * 1000UL; // 17 min
+const unsigned long PUMP2_MAX_RUNTIME_MS = 2UL * 60UL * 1000UL; // 27 min
+
+
 // ---- HTTP live ultrasonic handling ----
 volatile bool httpWaitingForUltrasonic = false;
 unsigned long httpRequestStartMs = 0;
@@ -324,6 +334,8 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
 
       waitingForReady   = false;
       sessionActive     = true;
+      pumpSessionStartMs = millis();
+
       startPhaseLogged = false;
       lastSessionActive = true;
       lastAutoCutoff    = autoCutoffEnabled;
@@ -344,6 +356,8 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
 
     case 53:  // ACK_STOP from indicator
       DBG("SERVER: ACK_STOP received");
+      pumpSessionStartMs = 0;
+
       stopAcked = true;
       blinkPattern(4);
       sessionActive = false;
@@ -378,14 +392,23 @@ void setup() {
   // 2️⃣ THEN start WebServer
   serverHTTP.on("/status", handleStatus);
 
-  WiFi.mode(WIFI_STA);
-  WiFi.begin("TankNet", "tank1234");
+  WiFi.mode(WIFI_AP_STA);
+
+  // 🔴 FORCE CHANNEL 1 BY CREATING AP
+  WiFi.softAP("TankServer", "12345678", 1);
+  delay(100);
+
+  // Optional: connect to router AFTER AP is up
+  WiFi.begin("Tank-WiFi", "12345678");
+
 
   Serial.print("Connecting to WiFi");
   while (WiFi.status() != WL_CONNECTED) {
     delay(300);
     Serial.print(".");
   }
+
+
 
   Serial.println();
   Serial.print("Connected. IP: ");
@@ -569,6 +592,38 @@ void loop() {
     bootPressStart = 0;
     bootPressConsumed = false;
   }
+
+  // ---- HARD SAFETY AUTO-CUTOFF (SERVER AUTHORITY) ----
+  if (sessionActive) {
+
+    unsigned long elapsed = millis() - pumpSessionStartMs;
+
+    // ---- Pump 1 safety cutoff ----
+    if (!tank1Off && elapsed > PUMP1_MAX_RUNTIME_MS) {
+      DBG("SERVER: HARD SAFETY CUTOFF → PUMP 1---------------------");
+
+      // Turn OFF pump 1
+      myServo.write(80);   // <-- Pump-1 OFF angle (use correct one)
+      tank1Off = true;
+    }
+
+    // ---- Pump 2 safety cutoff ----
+    if (!tank2Off && elapsed > PUMP2_MAX_RUNTIME_MS) {
+      DBG("SERVER: HARD SAFETY CUTOFF → PUMP 2---------------------");
+
+      // Turn OFF pump 2
+      myServo.write(0);    // <-- Pump-2 OFF angle (use correct one)
+      tank2Off = true;
+    }
+
+    // If both pumps are now OFF, end session
+    if (tank1Off && tank2Off) {
+      DBG("SERVER: BOTH PUMPS OFF → SESSION TERMINATED");
+      sessionActive = false;
+      lastSessionActive = false;
+    }
+  }
+
 
   delay(100);
 }
