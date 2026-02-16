@@ -7,7 +7,12 @@ import platform
 PIOENV = env["PIOENV"]
 OS = platform.system()  # 'Windows' or 'Darwin' (macOS)
 
-custom_location = env.GetProjectOption("custom_location")
+custom_location = None
+
+try:
+    custom_location=env.GetProjectOption("custom_location")
+except Exception as e:
+    print(e)
 
 # ---- LOCATION MAP PER OS ----
 TARGETS = {
@@ -20,7 +25,7 @@ TARGETS = {
         "indicator": "1-1.1", # corner usb 2 port (not usb 3)
     }
 }
-
+print(f"custom_location = {custom_location}")
 if custom_location:
     target_location = custom_location
     print(f"[AUTO] Using custom_location from platformio.ini = {target_location}")
@@ -33,6 +38,7 @@ else:
 
     target_location = TARGETS[OS][PIOENV]
 
+print(f"TARGETS[OS][PIOENV] = {TARGETS[OS][PIOENV]}")
 print(f"[AUTO] OS = {OS}")
 print(f"[AUTO] Target {PIOENV} at USB LOCATION = {target_location}")
 

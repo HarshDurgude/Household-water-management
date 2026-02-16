@@ -1,6 +1,6 @@
 import React from "react";
 import { useLocation, Link } from "react-router-dom";
-import { Settings, User } from "lucide-react";
+import {  User } from "lucide-react";
 import { useStatusBarPadding } from "../utils/useStatusBarPadding";
 
 export default function TopBar() {
@@ -36,9 +36,9 @@ export default function TopBar() {
 
         {/* RIGHT ICONS */}
         <div className="flex items-center gap-3">
-          <Link to="/settings" className="p-2">
+          {/* <Link to="/settings" className="p-2">
             <Settings className="w-5 h-5 text-white/80" />
-          </Link>
+          </Link> */}
           <Link to="/account" className="p-2">
             <User className="w-5 h-5 text-white/80" />
           </Link>

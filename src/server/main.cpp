@@ -4,22 +4,26 @@
 #include "esp_wifi.h"
 #include <ESP32Servo.h>
 #include <WebServer.h>
+
 WebServer serverHTTP(80);
 
 void sendCode(const uint8_t *mac, uint8_t code);
 
 bool bootWindowLogged = false;
 
-bool startPhaseLogged = false;
+bool logOnce(bool &flag) {
+  if (flag) return false;
+  flag = true;
+  return true;
+}
 
-// ---- HARD SAFETY CUTOFF (SERVER-SIDE, PER PUMP) ----
 
-// When pump session started
-unsigned long pumpSessionStartMs = 0;
+volatile bool pendingPumpOn  = false;
+volatile bool pendingPumpOff = false;
 
-// 🔴 ADJUST THESE TIMES AS NEEDED
-const unsigned long PUMP1_MAX_RUNTIME_MS = 1UL * 60UL * 1000UL; // 17 min
-const unsigned long PUMP2_MAX_RUNTIME_MS = 2UL * 60UL * 1000UL; // 27 min
+
+bool pumpIsOn = false;   // 🔴 single source of truth
+
 
 
 // ---- HTTP live ultrasonic handling ----
@@ -71,15 +75,16 @@ const unsigned long LED_COOLDOWN_MS = 2000;
 
 
 // ---- Pins ----
-#define SERVO_PIN        5    // Servo signal
+#define SERVO_PIN        15    // Servo signal
 #define TOUCH_TEST_PIN   4    // capacitive: server→indicator range test
-#define TOUCH_TANK1_PIN 13    // capacitive: query tank1
-#define TOUCH_TANK2_PIN 27    // capacitive: query tank2
+#define TOUCH_TANK_PIN 13    // capacitive: query tank
 #define TOUCH_MOTOR_PIN 32    // capacitive: local servo test
 
 // ---- Indicator MAC (your indicator board) ----
-// Replace if different:
-uint8_t indicatorAddress[] = { 0x38, 0x18, 0x2B, 0x8A, 0x46, 0x08 };
+uint8_t indicatorAddress[] = { 
+  0x38, 0x18, 0x2B, 0x8B, 0x3E, 0x5C 
+};
+
 
 typedef struct {
   uint8_t type;    // message type (70 = policy, 71 = ACK)
@@ -100,19 +105,17 @@ typedef struct {
 Servo myServo;
 
 // ---- Touch baselines ----
-uint16_t baseTest4, baseTank1_13, baseTank2_27, baseMotor32;
+uint16_t baseTest4, baseTank1_13, baseMotor32;
 const uint16_t TOUCH_MARGIN = 20;
 
 bool prevTouchTest   = false;
 bool prevTouchT1     = false;
-bool prevTouchT2     = false;
 bool prevTouchMotor  = false;
 
 // ---- Session state ----
 bool waitingForReady = true;   // waiting for READY after STARTs
 bool sessionActive   = false;  // in pump mode
-bool tank1Off        = false;
-bool tank2Off        = false;
+bool pumpOff        = false;
 bool stopAcked       = false;
 
 unsigned long startPhaseStartMs = 0;
@@ -129,6 +132,26 @@ const unsigned long START_SEND_PERIOD_MS   = 200;     // every 200ms
 // HELPER FUNCTIONS
 // ---------------------------------
 
+void sendCORS() {
+  serverHTTP.sendHeader("Access-Control-Allow-Origin", "*");
+  serverHTTP.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+  serverHTTP.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+}
+
+
+void pumpOnFunc() {
+  DBG("SERVER: Pump ON requested");
+  pendingPumpOn = true;
+}
+
+void pumpOffFunc(const char* reason = "Manual") {
+  DBG2("SERVER: Pump OFF requested, reason = ", reason);
+  pendingPumpOff = true;
+}
+
+
+
+
 void blinkPattern(int count, int onMs = 200, int offMs = 200) {
   // Prevent overlapping patterns
   if (millis() < ledCooldownUntil) return;
@@ -144,6 +167,14 @@ void blinkPattern(int count, int onMs = 200, int offMs = 200) {
   ledCooldownUntil = millis() + LED_COOLDOWN_MS;
 }
 
+// void handleCorsOptions() {
+//   serverHTTP.sendHeader("Access-Control-Allow-Origin", "*");
+//   serverHTTP.sendHeader("Access-Control-Allow-Methods", "GET, POST, OPTIONS");
+//   serverHTTP.sendHeader("Access-Control-Allow-Headers", "Content-Type");
+//   serverHTTP.send(204);
+// }
+
+
 void handleStatus() {
 
   // ✅ CORS HEADERS (THIS IS THE FIX)
@@ -151,7 +182,7 @@ void handleStatus() {
   serverHTTP.sendHeader("Access-Control-Allow-Methods", "GET, OPTIONS");
   serverHTTP.sendHeader("Access-Control-Allow-Headers", "Content-Type");
 
-  DBG("HTTP: /status requested → triggering live ultrasonic");
+  // DBG("HTTP: /status requested → triggering live ultrasonic");
 
   // Reset live values
   httpDistanceCm = -1;
@@ -184,14 +215,24 @@ void handleStatus() {
   }
 
   // Success → send live data
-  DBG("HTTP: ultrasonic response received → sending JSON");
+  // DBG("HTTP: ultrasonic response received → sending JSON");
+
+  Serial.print("HTTP: Tank ");
+  Serial.print(httpTankPercent, 1);
+  Serial.print("% | Distance ");
+  Serial.print(httpDistanceCm, 1);
+  Serial.println(" cm");
+
 
   String json = "{";
   json += "\"tankPercent\":" + String(httpTankPercent, 1) + ",";
   json += "\"distanceCm\":" + String(httpDistanceCm, 1) + ",";
   json += "\"sessionActive\":" + String(lastSessionActive ? "true" : "false") + ",";
   json += "\"autoCutoff\":" + String(lastAutoCutoff ? "true" : "false");
+  json += ",\"pumpOn\":" + String(pumpIsOn ? "true" : "false");
   json += "}";
+
+  DBG2("HTTP STATUS: pumpIsOn = ", pumpIsOn ? "ON" : "OFF");
 
   serverHTTP.send(200, "application/json", json);
 }
@@ -209,7 +250,7 @@ void ensurePeer(const uint8_t *mac) {
 void sendCode(const uint8_t *mac, uint8_t code) {
   ensurePeer(mac);
   if (code == 60) {
-    DBG("SERVER: Requesting ultrasonic measurement from indicator");
+    // DBG("SERVER: Requesting ultrasonic measurement from indicator");
   } 
   TankMessage msg;
   msg.tankId = code;
@@ -252,13 +293,13 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
       httpDistanceCm = ultra.value / 100.0;
       lastDistanceCm = httpDistanceCm;   // keep last-known in sync
 
-      DBG2("SERVER RX: Ultrasonic distance cm = ", httpDistanceCm);
+      // DBG2("SERVER RX: Ultrasonic distance cm = ", httpDistanceCm);
     } 
     else if (ultra.type == 63) {
       httpTankPercent = ultra.value / 100.0;
       lastTankPercent = httpTankPercent; // keep last-known in sync
 
-      DBG2("SERVER RX: Tank level % = ", httpTankPercent);
+      // DBG2("SERVER RX: Tank level % = ", httpTankPercent);
     }
 
     // If HTTP is waiting and both values are ready → mark done
@@ -267,7 +308,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
         httpTankPercent >= 0) {
 
       httpWaitingForUltrasonic = false;
-      DBG("SERVER: Ultrasonic response COMPLETE → HTTP can reply");
+      // DBG("SERVER: Ultrasonic response COMPLETE → HTTP can reply");
     }
 
     return;
@@ -288,20 +329,17 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
   const uint8_t *sender = mac;
 
   switch (msg.tankId) {
-    case 1:
-      blinkPattern(1);
-      myServo.write(80); delay(1000); myServo.write(40);
-      tank1Off = true;
-      sendCode(sender, 1);
-      break;
-
-
-    case 2:   // Tank2 FULL or timeout
+    case 1:  // Tank FULL
+      DBG("SERVER: Tank FULL → turning pump OFF");
       blinkPattern(2);
-      myServo.write(0); delay(1000); myServo.write(40);
-      tank2Off = true;
-      sendCode(sender, 2);   // ACK 2 back
+      pumpOffFunc("Tank Full (Probes)");
+      // DBG("SERVER: Pump Off servo run (Tank Full By Probes) ");
+      pumpOff = true;
+      sendCode(sender, 1); // ACK
       break;
+
+
+
 
     // ----- Indicator range test -----
     case 3:   // indicator test ping
@@ -321,48 +359,51 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len){
       blinkPattern(1);       // 1 blink = NOT full
       break;
 
-    case 21:  // tank2 FULL
-      blinkPattern(2);
-      break;
-    case 22:  // tank2 NOT full
-      blinkPattern(1);
-      break;
 
     // ----- Pump session handshake -----
-    case 51:  // READY from indicator
-      DBG("SERVER: READY (51) received → session established");
+    case 51:
+      static bool readyLogged = false;
+      if (logOnce(readyLogged)) {
+        DBG("SERVER: READY received → session established");
+      }
 
-      waitingForReady   = false;
-      sessionActive     = true;
-      pumpSessionStartMs = millis();
 
-      startPhaseLogged = false;
+      waitingForReady    = false;
+      sessionActive      = true;
+
+      pumpOff       = false;
+      stopAcked     = false;
+      stopSendCount = 0;
+
       lastSessionActive = true;
       lastAutoCutoff    = autoCutoffEnabled;
-
-      // 🔴 HARD STOP for START spam
-      lastStartSendMs = 0;
-      DBG("SERVER: STOPPING START(50) transmission");
 
       blinkPattern(3,120,120);
 
       ControlMessage policy;
       policy.type  = 70;
       policy.value = autoCutoffEnabled ? 1 : 0;
-
       esp_now_send(sender, (uint8_t*)&policy, sizeof(policy));
       break;
 
 
-    case 53:  // ACK_STOP from indicator
-      DBG("SERVER: ACK_STOP received");
-      pumpSessionStartMs = 0;
+
+    case 53:
+      static bool stopAckLogged = false;
+      if (logOnce(stopAckLogged)) {
+        DBG("SERVER: STOP acknowledged by indicator");
+      }
+
 
       stopAcked = true;
-      blinkPattern(4);
+
       sessionActive = false;
-      lastSessionActive = false;   // ✅ ADD THIS
+      lastSessionActive = false;
+      waitingForReady = true;
+
+      blinkPattern(4);
       break;
+
 
 
     // case 61:
@@ -386,11 +427,41 @@ void setup() {
 
   Serial.begin(115200);
   delay(300);
-  DBG("BOOT");
+  DBG("BOOT - Uploaded via OTA");
 
 
   // 2️⃣ THEN start WebServer
   serverHTTP.on("/status", handleStatus);
+
+  serverHTTP.on("/pump/on", HTTP_POST, []() {
+    DBG("HTTP: Pump ON request received");
+    sendCORS();
+
+    pumpOnFunc();
+
+    serverHTTP.send(
+      200,
+      "application/json",
+      "{\"ok\":true,\"pumpOn\":true}"
+    );
+  });
+
+  serverHTTP.on("/pump/off", HTTP_POST, []() {
+    DBG("HTTP: Pump OFF request received");
+    sendCORS();
+
+    pumpOffFunc("Manual");
+
+    serverHTTP.send(
+      200,
+      "application/json",
+      "{\"ok\":true,\"pumpOn\":false}"
+    );
+  });
+
+
+
+
 
   WiFi.mode(WIFI_AP_STA);
 
@@ -398,8 +469,23 @@ void setup() {
   WiFi.softAP("TankServer", "12345678", 1);
   delay(100);
 
+  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
+
   // Optional: connect to router AFTER AP is up
-  WiFi.begin("Tank-WiFi", "12345678");
+
+  // ---------- FIXED STATIC IP FOR ESP32 SERVER ----------
+  IPAddress local_IP(192, 168, 4, 10);
+  IPAddress gateway(192, 168, 4, 1);
+  IPAddress subnet(255, 255, 255, 0);
+  IPAddress dns(8, 8, 8, 8);
+
+  // Must be called BEFORE WiFi.begin()
+  if (!WiFi.config(local_IP, gateway, subnet, dns)) {
+    Serial.println("STA Failed to configure static IP");
+  }
+
+
+  WiFi.begin("Tank-Network", "12345678");
 
 
   Serial.print("Connecting to WiFi");
@@ -414,9 +500,26 @@ void setup() {
   Serial.print("Connected. IP: ");
   Serial.println(WiFi.localIP());
 
+  // serverHTTP.on("/pump/on", HTTP_OPTIONS, handleCorsOptions);
+  // serverHTTP.on("/pump/off", HTTP_OPTIONS, handleCorsOptions);
+  // serverHTTP.on("/status", HTTP_OPTIONS, handleCorsOptions);
+
+
+  // 🔴 REQUIRED FOR CORS PREFLIGHT
+  serverHTTP.onNotFound([]() {
+    if (serverHTTP.method() == HTTP_OPTIONS) {
+      sendCORS();
+      serverHTTP.send(204); // No Content
+    } else {
+      serverHTTP.send(404, "text/plain", "Not found");
+    }
+  });
 
   serverHTTP.begin();
   DBG("HTTP server started");
+
+
+
 
   // 3️⃣ THEN everything else (ESP-NOW, GPIO, logic)
   pinMode(BOOT_PIN, INPUT_PULLUP);
@@ -426,12 +529,17 @@ void setup() {
   digitalWrite(LED_PIN, LOW);
 
   myServo.attach(SERVO_PIN, 500, 2400);
-  myServo.write(40);
+  delay(800);                 // 🔴 CRITICAL: let servo initialize
+  pumpOffFunc("Boot");   // or "Tank Full", "Boot", etc.
+
+
+  DBG("SERVER: Pump Off on Boot (servo initialized)");
+
+
 
   // Calibrate capacitive touch pins
   baseTest4    = calibrateTouchPin(TOUCH_TEST_PIN);
-  baseTank1_13 = calibrateTouchPin(TOUCH_TANK1_PIN);
-  baseTank2_27 = calibrateTouchPin(TOUCH_TANK2_PIN);
+  baseTank1_13 = calibrateTouchPin(TOUCH_TANK_PIN);
   baseMotor32  = calibrateTouchPin(TOUCH_MOTOR_PIN);
 
 
@@ -447,7 +555,7 @@ void setup() {
   // Session state
   waitingForReady = true;
   sessionActive   = false;
-  tank1Off = tank2Off = false;
+  pumpOff = false;
   stopAcked = false;
   stopSendCount = 0;
 
@@ -519,7 +627,11 @@ void loop() {
     if (now - startPhaseStartMs < START_PHASE_DURATION_MS) {
       if (now - lastStartSendMs > START_SEND_PERIOD_MS) {
 
-        DBG("SERVER: Attempting to wake indicator");
+        static bool startPhasePrinted = false;
+        if (logOnce(startPhasePrinted)) {
+          DBG("SERVER: START phase → waking indicator");
+        }
+
         sendCode(indicatorAddress, 50);
 
         lastStartSendMs = now;
@@ -528,7 +640,7 @@ void loop() {
   }
 
   // ---- STOP sending logic ----
-  if (sessionActive && tank1Off && tank2Off && !stopAcked) {
+  if (sessionActive && pumpOff && !stopAcked) {
     if (stopSendCount < MAX_STOP_SENDS && now - lastStopSendMs > STOP_SEND_PERIOD_MS) {
       sendCode(indicatorAddress, 52);   // STOP
       lastStopSendMs = now;
@@ -551,26 +663,20 @@ void loop() {
   prevTouchTest = touchUltra;
 
   // 2) Query Tank1 (GPIO13)
-  bool touchT1 = isTouch(TOUCH_TANK1_PIN, baseTank1_13);
+  bool touchT1 = isTouch(TOUCH_TANK_PIN, baseTank1_13);
   if (touchT1 && !prevTouchT1) {
     sendCode(indicatorAddress, 10);      // ask tank1 status
     delay(200);
   }
   prevTouchT1 = touchT1;
 
-  // 3) Query Tank2 (GPIO27)
-  bool touchT2 = isTouch(TOUCH_TANK2_PIN, baseTank2_27);
-  if (touchT2 && !prevTouchT2) {
-    sendCode(indicatorAddress, 20);      // ask tank2 status
-    delay(200);
-  }
-  prevTouchT2 = touchT2;
 
   // 4) Local servo test (GPIO32)
   bool touchMotor = isTouch(TOUCH_MOTOR_PIN, baseMotor32);
   if (touchMotor && !prevTouchMotor) {
-    myServo.write(80); delay(500); myServo.write(40); delay(250);
-    myServo.write(0);  delay(500); myServo.write(40);
+    pumpOffFunc("GPIO Test");
+
+    DBG("SERVER: GPIO32 Local servo Test ");
   }
   prevTouchMotor = touchMotor;
 
@@ -593,36 +699,45 @@ void loop() {
     bootPressConsumed = false;
   }
 
-  // ---- HARD SAFETY AUTO-CUTOFF (SERVER AUTHORITY) ----
-  if (sessionActive) {
 
-    unsigned long elapsed = millis() - pumpSessionStartMs;
 
-    // ---- Pump 1 safety cutoff ----
-    if (!tank1Off && elapsed > PUMP1_MAX_RUNTIME_MS) {
-      DBG("SERVER: HARD SAFETY CUTOFF → PUMP 1---------------------");
+  static unsigned long servoActionAt = 0;
+  static int servoStep = 0;
 
-      // Turn OFF pump 1
-      myServo.write(80);   // <-- Pump-1 OFF angle (use correct one)
-      tank1Off = true;
-    }
+  if (pendingPumpOn) {
+    if (servoStep == 0) {
+      myServo.write(0);
+      servoActionAt = millis();
+      servoStep = 1;
+    } else if (servoStep == 1 && millis() - servoActionAt >= 500) {
+      myServo.write(40);
+      pendingPumpOn = false;
+      servoStep = 0;
 
-    // ---- Pump 2 safety cutoff ----
-    if (!tank2Off && elapsed > PUMP2_MAX_RUNTIME_MS) {
-      DBG("SERVER: HARD SAFETY CUTOFF → PUMP 2---------------------");
+      pumpIsOn = true;   // ✅ ADD THIS LINE
 
-      // Turn OFF pump 2
-      myServo.write(0);    // <-- Pump-2 OFF angle (use correct one)
-      tank2Off = true;
-    }
-
-    // If both pumps are now OFF, end session
-    if (tank1Off && tank2Off) {
-      DBG("SERVER: BOTH PUMPS OFF → SESSION TERMINATED");
-      sessionActive = false;
-      lastSessionActive = false;
+      DBG("SERVER: Pump ON sequence complete");
     }
   }
+
+
+  if (pendingPumpOff) {
+    if (servoStep == 0) {
+      myServo.write(75);
+      servoActionAt = millis();
+      servoStep = 1;
+    } else if (servoStep == 1 && millis() - servoActionAt >= 500) {
+      myServo.write(40);
+      pendingPumpOff = false;
+      servoStep = 0;
+
+      pumpIsOn = false;  // ✅ ADD THIS LINE
+
+      DBG("SERVER: Pump OFF sequence complete");
+    }
+  }
+
+
 
 
   delay(100);

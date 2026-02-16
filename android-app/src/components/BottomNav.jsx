@@ -1,5 +1,5 @@
 import { Link, useLocation } from "react-router-dom";
-import { Zap, Droplet, GitBranch } from "lucide-react";
+import { Zap, Droplet, Settings } from "lucide-react";
 
 export default function BottomNav() {
   const { pathname } = useLocation();
@@ -16,9 +16,9 @@ export default function BottomNav() {
       icon: Droplet,
     },
     {
-      to: "/taps",
-      label: "Taps",
-      icon: GitBranch,
+      to: "/settings",
+      label: "Settings",
+      icon: Settings,
     },
   ];
 

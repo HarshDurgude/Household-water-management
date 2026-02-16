@@ -1,8 +1,21 @@
 import { useTankStatus } from "../hooks/useTankStatus";
-import React from "react";
+import { useEffect } from "react";
+
+
 
 export default function Tank() {
-  const { data } = useTankStatus();
+  const { data } = useTankStatus(true);
+  useEffect(() => {
+    console.log("APP BOOTED");
+    fetch("http://192.168.4.10/status")
+      .then(r => {
+        console.log("FETCH STATUS OK", r.status);
+        return r.text();
+      })
+      .then(t => console.log("FETCH BODY", t))
+      .catch(e => console.error("FETCH FAILED", e));
+  }, []);
+
   return (
     <div className="h-full flex items-center justify-center px-4">
       <div className="flex flex-col items-center gap-6">
@@ -18,7 +31,7 @@ export default function Tank() {
           <div className="text-5xl font-bold">
             {data ? Math.round(data.tankPercent) + "%" : "--"}
           </div>
-          <div className="text-sm text-white/60">100 L Tank</div>
+          <div className="text-sm text-white/60">20 L Tank</div>
         </div>
 
         <div className="flex gap-4">

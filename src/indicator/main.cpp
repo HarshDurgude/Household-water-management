@@ -5,9 +5,27 @@
 #include <esp_sleep.h>
 #include <esp_wifi.h>
 
-bool firstBootWindow = true;
-
 volatile bool pumpCommit = false;
+
+volatile bool allowIdleSleep = true;
+
+
+bool logOnce(bool &flag) {
+  if (flag) return false;
+  flag = true;
+  return true;
+}
+
+
+// ---- Session mode (set by server policy) ----
+enum SessionMode {
+  MODE_CONTINUOUS = 0,  // autoCutoff = 0
+  MODE_NORMAL     = 1   // autoCutoff = 1
+};
+
+volatile SessionMode sessionMode = MODE_NORMAL; // default = idle sleep mode
+
+
 
 
 // add near the top with other globals
@@ -51,7 +69,7 @@ volatile uint8_t last_sent_code = 0;
 #define ULTRA_ECHO_PIN 19
 
 // ---- Tank geometry ----
-#define TANK_HEIGHT_CM 41.5
+#define TANK_HEIGHT_CM 32
 
 
 // ---- BOOT button range test (indicator side) ----
@@ -69,8 +87,7 @@ const unsigned long LED_COOLDOWN_MS = 2000;
 // test comment
 
 // ----- Pins -----
-const int TANK1_PIN = 23;
-const int TANK2_PIN = 22;
+const int TANK_PIN = 23;
 const int LED_PIN   = 2;
 const int TOUCH_PIN = 4;    // capacitive touch for range-test
 
@@ -79,15 +96,11 @@ RTC_DATA_ATTR bool rtcInPumpMode = false;
 
 // ----- Tank detection state -----
 bool prevTank1Full = false;
-bool prevTank2Full = false;
 
 // ----- Pump-mode flags -----
 bool tank1Sent = false;  // did we already send tank1 full/timeout?
-bool tank2Sent = false;  // did we already send tank2 full/timeout?
 bool stopRequested = false;
 
-
-unsigned long pumpModeStartMs = 0;
 
 // Idle listening window
 const unsigned long IDLE_LISTEN_MS        = 2000;             // ~1s listen
@@ -96,7 +109,6 @@ const unsigned long IDLE_WAKE_INTERVAL_US = 5ULL * 1000000ULL; // wake every 5s
 // Idle state
 bool startLatched = false;
 bool idleInitDone   = false;
-bool startReceived  = false;
 unsigned long idleStartMs = 0;
 
 // Server MAC (room ESP32) – change if needed
@@ -164,17 +176,10 @@ void onDataSent(const uint8_t *mac_addr, esp_now_send_status_t status) {
   last_send_done = true;
   last_send_success = (status == ESP_NOW_SEND_SUCCESS);
 
-  // print the MAC and status for debugging
-  char macStr[18];
-  sprintf(macStr, "%02X:%02X:%02X:%02X:%02X:%02X",
-          mac_addr[0], mac_addr[1], mac_addr[2],
-          mac_addr[3], mac_addr[4], mac_addr[5]);
-
-  if (last_send_success) {
-    DBG2(String("INDICATOR: send to ") + String(macStr) + " succeeded, code=" + String(last_sent_code), "");
-  } else {
-    DBG2(String("INDICATOR: send to ") + String(macStr) + " FAILED, code=" + String(last_sent_code), "");
+  if (!last_send_success) {
+    DBG("INDICATOR: ESP-NOW send FAILED");
   }
+  // ✅ SUCCESS IS SILENT (no log)
 }
 
 
@@ -226,7 +231,7 @@ void computeWaterLevel(float distanceCm,
     return;
   }
 
-  waterHeight = TANK_HEIGHT_CM - distanceCm;
+  waterHeight = TANK_HEIGHT_CM - (distanceCm-4.8);
 
   if (waterHeight < 0) waterHeight = 0;
   if (waterHeight > TANK_HEIGHT_CM) waterHeight = TANK_HEIGHT_CM;
@@ -260,12 +265,24 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
     ControlMessage ctrl;
     memcpy(&ctrl, data, sizeof(ctrl));
     if (ctrl.type == 70) {
-      // Server policy / ACK for READY — treat as final ACK
-      // For debugging, print
-      DBG2("INDICATOR: ControlMessage 70 received (policy/ack) value=", ctrl.value);
-      // Optionally clear any retry state here if you used a retry loop
-      // e.g., mark that server acknowledged READY
+      static bool policyLogged = false;
+      if (logOnce(policyLogged)) {
+        DBG2("INDICATOR: Session mode = ", ctrl.value == 0 ? "CONTINUOUS" : "NORMAL");
+      }
+
+
+      if (ctrl.value == 1) {
+        sessionMode = MODE_NORMAL;
+        allowIdleSleep = true;
+        DBG("INDICATOR: Session mode = NORMAL (auto sleep enabled)");
+      } else {
+        sessionMode = MODE_CONTINUOUS;
+        allowIdleSleep = false;
+        DBG("INDICATOR: Session mode = CONTINUOUS (stay awake)");
+      }
+
     }
+
     return;
   }
 
@@ -284,10 +301,7 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
       // ACK Tank1 full
       blinkLed(1);
       break;
-    case 2:
-      // ACK Tank2 full
-      blinkLed(2);
-      break;
+
 
     // ---- ACK for indicator's own test ----
     case 3:
@@ -303,19 +317,13 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
     // ---- Server tank1 status query ----
     case 10: {
-      bool full = isTankFull(TANK1_PIN);
+      bool full = isTankFull(TANK_PIN);
       if (full) sendCode(11);
       else      sendCode(12);
       break;
     }
 
-    // ---- Server tank2 status query ----
-    case 20: {
-      bool full = isTankFull(TANK2_PIN);
-      if (full) sendCode(21);
-      else      sendCode(22);
-      break;
-    }
+
 
     // ---- Pump-session handshake: START / STOP ----
     case 50: {  // START from server — atomic ACCEPT + immediate READY (3x)
@@ -329,23 +337,21 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
         startLatched    = true;
         pumpCommit      = true;
         idleInitDone    = false;
-        pumpModeStartMs = millis();
 
         // measure initial tank states
-        bool initialTank1Full = isTankFull(TANK1_PIN);
-        bool initialTank2Full = isTankFull(TANK2_PIN);
+        bool initialTank1Full = isTankFull(TANK_PIN);
         prevTank1Full = initialTank1Full;
-        prevTank2Full = initialTank2Full;
-        tank1Sent = tank2Sent = false;
+        tank1Sent  = false;
 
         // ----- CRITICAL: send READY multiple times immediately -----
         // send 3 quick copies with a short gap so server receives at least one
+        DBG("INDICATOR: READY sent to server");
+
         for (int i = 0; i < 3; ++i) {
-          esp_err_t r = sendCode(51);   // READY
-          (void)r; // we log in onDataSent
-          // tiny jitter between sends to reduce collisions
+          esp_err_t r = sendCode(51);
           delay(40);
         }
+
         blinkLed(3, 120, 120);
 
         // If tanks are already full, inform server now
@@ -353,13 +359,10 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
           sendCode(1);
           tank1Sent = true;
         }
-        if (initialTank2Full) {
-          sendCode(2);
-          tank2Sent = true;
-        }
 
       } else {
-        DBG("INDICATOR: START ignored (already committed)");
+        // DBG("INDICATOR: START ignored (already committed)");
+
       }
       break;
     }
@@ -367,44 +370,45 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 
 
     case 52:  // STOP from server
-      DBG("INDICATOR: STOP received");
+      // DBG("INDICATOR: STOP received");
 
       // Pump session end requested
       stopRequested = true;
       break;
 
-    case 60: {  // Ultrasonic query
-      DBG("INDICATOR: Ultrasonic query (60) → measuring");
+      case 60: {
+        float dist = measureUltrasonicCm();
+        float waterH = 0, percent = 0;
+        computeWaterLevel(dist, waterH, percent);
 
-      float dist = measureUltrasonicCm();
-      float waterH = 0, percent = 0;
-      computeWaterLevel(dist, waterH, percent);
+        if (dist < 0) {
+          DBG("INDICATOR: Ultrasonic out of range");
+          break;
+        }
 
-      if (dist < 0) {
-        DBG("INDICATOR: Ultrasonic out of range");
+        // KEEP THESE TWO
+        // DBG2("INDICATOR: Distance (cm): ", dist);
+        // DBG2("INDICATOR: Level (%): ", percent);
+        Serial.print("INDICATOR: (Querry) - Tank ");
+        Serial.print(percent, 1);
+        Serial.print("% | Distance ");
+        Serial.print(dist, 1);
+        Serial.println(" cm");
+
+        UltraData msg;
+
+        msg.type  = 61;
+        msg.value = (int16_t)(dist * 100);
+        esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
+        delay(40);
+
+        msg.type  = 63;
+        msg.value = (int16_t)(percent * 100);
+        esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
+
         break;
       }
 
-      // ---- DEBUG (still useful) ----
-      DBG2("INDICATOR: Distance (cm): ", dist);
-      DBG2("INDICATOR: Level (%): ", percent);
-
-      UltraData msg;
-
-      // Send distance (cm)
-      msg.type  = 61;
-      msg.value = (int16_t)(dist * 100);
-      esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
-      DBG("INDICATOR: Ultrasonic data sent to server");
-      delay(40);
-
-      // Send percentage (%)
-      msg.type  = 63;
-      msg.value = (int16_t)(percent * 100);
-      esp_now_send(serverAddress, (uint8_t*)&msg, sizeof(msg));
-
-      break;
-    }
 
     default:
       break;
@@ -415,6 +419,8 @@ void onDataRecv(const uint8_t *mac, const uint8_t *data, int len) {
 // SETUP
 // ---------------------------------
 void setup() {
+  allowIdleSleep = true;
+
   Serial.begin(115200);
   delay(300);
   DBG("BOOT");
@@ -425,8 +431,7 @@ void setup() {
   pinMode(LED_PIN, OUTPUT);
   digitalWrite(LED_PIN, LOW);
 
-  pinMode(TANK1_PIN, INPUT_PULLUP);
-  pinMode(TANK2_PIN, INPUT_PULLUP);
+  pinMode(TANK_PIN, INPUT_PULLUP);
 
   pinMode(ULTRA_TRIG_PIN, OUTPUT);
   pinMode(ULTRA_ECHO_PIN, INPUT);
@@ -436,7 +441,6 @@ void setup() {
   // 🔴 FORCE SAME CHANNEL AS SERVER
   esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
-  esp_wifi_set_channel(1, WIFI_SECOND_CHAN_NONE);
 
   esp_now_init();
 
@@ -452,11 +456,13 @@ void setup() {
   calibrateTouch();
 
   // Initial states (used before we know mode)
-  prevTank1Full = isTankFull(TANK1_PIN);
-  prevTank2Full = isTankFull(TANK2_PIN);
+  
+  // sessionMode = MODE_CONTINUOUS; // safe default on reboot
+
+
+  prevTank1Full = isTankFull(TANK_PIN);
 
   idleInitDone    = false;
-  startReceived   = false;
   prevTouchActive = false;
   stopRequested   = false;
 }
@@ -465,6 +471,17 @@ void setup() {
 // IDLE MODE HANDLER (deep sleep cycle)
 // ---------------------------------
 void handleIdleMode() {
+
+  if (!allowIdleSleep) {
+    static bool awakeLogged = false;
+    if (logOnce(awakeLogged)) {
+      DBG("INDICATOR: Idle sleep disabled → staying awake");
+    }
+    delay(100);
+    return;
+  }
+
+
   if (pumpCommit) {
     // Pump already committed → idle mode forbidden
     return;
@@ -474,11 +491,12 @@ void handleIdleMode() {
   if (!idleInitDone) {
     idleStartMs   = millis();
     idleInitDone  = true;
-    if (!startLatched) {
-      startReceived = false;
+
+    static bool idleLogged = false;
+    if (logOnce(idleLogged)) {
+      DBG("INDICATOR: Idle mode active");
     }
 
-    DBG("INDICATOR: Idle listen window started");
   }
 
   // 🔴 IMPORTANT: give WiFi/ESP-NOW time to run
@@ -494,10 +512,9 @@ void handleIdleMode() {
     startLatched  = true;
     idleInitDone  = false;
 
-    pumpModeStartMs = millis();
 
-    bool initialTank1Full = isTankFull(TANK1_PIN);
-    bool initialTank2Full = isTankFull(TANK2_PIN);
+
+    bool initialTank1Full = isTankFull(TANK_PIN);
 
     sendCode(51);               // READY
     DBG("INDICATOR: READY (51) sent immediately after START accept");
@@ -505,15 +522,10 @@ void handleIdleMode() {
     blinkLed(3, 120, 120);
 
     prevTank1Full = initialTank1Full;
-    prevTank2Full = initialTank2Full;
 
     if (initialTank1Full) {
       sendCode(1);
       tank1Sent = true;
-    }
-    if (initialTank2Full) {
-      sendCode(2);
-      tank2Sent = true;
     }
 
     return;   // 🔴 IMPORTANT: exit idle handler immediately
@@ -524,16 +536,12 @@ void handleIdleMode() {
   // End of listen window
   if (millis() - idleStartMs > IDLE_LISTEN_MS) {
 
-    if (firstBootWindow) {
-      DBG("INDICATOR: First boot window expired, staying awake");
-      firstBootWindow = false;
-      idleInitDone = false;   // restart idle listening
-      return;
-    }
 
     DBG("INDICATOR: Idle timeout → sleeping");
     esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
     esp_deep_sleep_start();
+
+
   }
 }
 
@@ -541,72 +549,66 @@ void handleIdleMode() {
 // PUMP MODE HANDLER
 // ---------------------------------
 void handlePumpMode() {
-  unsigned long now = millis();
 
-  // ---- Tank sensing ----
-  bool tank1Full = isTankFull(TANK1_PIN);
-  bool tank2Full = isTankFull(TANK2_PIN);
-
-  bool tank1JustFull = (tank1Full && !prevTank1Full) && !tank1Sent;
-  bool tank2JustFull = (tank2Full && !prevTank2Full) && !tank2Sent;
-
-  if (tank1JustFull) {
-    sendCode(1);      // Tank1 full
-    tank1Sent = true;
-  }
-
-  if (tank2JustFull) {
-    sendCode(2);      // Tank2 full
-    tank2Sent = true;
-  }
-
-
-
-  prevTank1Full = tank1Full;
-  prevTank2Full = tank2Full;
-
-  // ---- Indicator's own capacitive range test (GPIO4) ----
-//   bool touchNow = isTouchActive();
-//   if (touchNow && !prevTouchActive) {
-//     sendCode(3);      // indicator test
-//     delay(200);
-//   }
-//   prevTouchActive = touchNow;
-
-  // ---- STOP handling ----
+  // =================================================
+  // 1️⃣ STOP HANDLING — HIGHEST PRIORITY
+  // =================================================
   if (stopRequested) {
     stopRequested = false;
 
-    DBG("INDICATOR: ENTERING IDLE MODE");
+    DBG("INDICATOR: STOP processed → exiting pump mode");
 
     blinkLed(4);
-    sendCode(53);
+    sendCode(53);   // ACK_STOP
     delay(200);
 
-    // Reset latches and commit
-    pumpCommit    = false;   // 🔴 REQUIRED
+    // Reset pump session state
+    pumpCommit    = false;
     startLatched  = false;
-    startReceived = false;
-
     rtcInPumpMode = false;
     idleInitDone  = false;
 
-
-    esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
-    esp_deep_sleep_start();
+    if (sessionMode == MODE_NORMAL) {
+      DBG("INDICATOR: NORMAL mode → entering deep sleep");
+      esp_sleep_enable_timer_wakeup(IDLE_WAKE_INTERVAL_US);
+      esp_deep_sleep_start();
+    } else {
+      DBG("INDICATOR: CONTINUOUS mode → staying awake for queries");
+      // Do NOT sleep
+      // Fall back to idle listening (no deep sleep)
+    }
   }
 
+
+  // =================================================
+  // 2️⃣ TANK SENSING (ONE TANK ONLY)
+  // =================================================
+  bool tankFull = isTankFull(TANK_PIN);
+  bool tankJustFull = (tankFull && !prevTank1Full) && !tank1Sent;
+
+  if (tankJustFull) {
+    DBG("INDICATOR: Tank FULL detected");
+    sendCode(1);           // Tank full notification
+    tank1Sent = true;
+  }
+
+  prevTank1Full = tankFull;
+
+  // =================================================
+  // 3️⃣ OPTIONAL RANGE TEST (BOOT BUTTON)
+  // =================================================
   bool bootPressed = (digitalRead(BOOT_PIN) == LOW);
-  // unsigned long now = millis();
 
   if (bootPressed) {
     if (bootPressStart == 0 && !bootPressConsumed) {
-      bootPressStart = now;
+      bootPressStart = millis();
     }
 
-    if (!bootPressConsumed && (now - bootPressStart > RANGE_LONG_PRESS_MS)) {
+    if (!bootPressConsumed &&
+        (millis() - bootPressStart > RANGE_LONG_PRESS_MS)) {
+
       DBG("INDICATOR: BOOT long press → RANGE TEST to SERVER");
-      sendCode(3);   // indicator-originated range test
+      sendCode(3);
       bootPressConsumed = true;
     }
   } else {
@@ -614,7 +616,9 @@ void handlePumpMode() {
     bootPressConsumed = false;
   }
 
-
+  // =================================================
+  // 4️⃣ LOOP THROTTLE
+  // =================================================
   delay(300);
 }
 

@@ -1,11 +1,12 @@
 import { useEffect, useState } from "react";
 import { fetchStatus } from "../api/status";
 
-export function useTankStatus(intervalMs = 1500) {
+export function useTankStatus(enabled = true, intervalMs = 1500) {
   const [data, setData] = useState(null);
-  const [error, setError] = useState(null);
 
   useEffect(() => {
+    if (!enabled) return;
+
     let alive = true;
 
     async function poll() {
@@ -13,7 +14,8 @@ export function useTankStatus(intervalMs = 1500) {
         const json = await fetchStatus();
         if (alive) setData(json);
       } catch (e) {
-        if (alive) setError(e.message);
+        // ❌ DO NOT show popup errors for background polling
+        console.warn("Tank status fetch failed:", e.message);
       }
     }
 
@@ -24,7 +26,7 @@ export function useTankStatus(intervalMs = 1500) {
       alive = false;
       clearInterval(id);
     };
-  }, [intervalMs]);
+  }, [enabled, intervalMs]);
 
-  return { data, error };
+  return { data };
 }

@@ -13,5 +13,9 @@ export default defineConfig({
   server: {
     host: true, // exposes to local network
     port: 5173,
+    strictPort: true,
+    allowedHosts: [
+      'harshals-macbook-air.local'
+    ]
   },
 })
